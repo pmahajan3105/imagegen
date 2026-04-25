@@ -335,7 +335,6 @@ export default function Home() {
   const [apiKey, setApiKey] = useState("");
   const [appMode] = useState<AppMode>("portrait");
   const [selectedPortraitReportIndex, setSelectedPortraitReportIndex] = useState(0);
-  const [outfitIdentityAcknowledged, setOutfitIdentityAcknowledged] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [improvementPrompt, setImprovementPrompt] = useState("");
   const [uploadedImage, setUploadedImage] = useState<File | null>(null);
@@ -402,10 +401,7 @@ export default function Home() {
   const batchMissingAnalyses: string[] = [];
   if (!portraitAnalysis) batchMissingAnalyses.push("portrait analysis");
   if (batchNeedsBody && !bodyAnalysis) batchMissingAnalyses.push("body analysis");
-  const batchMissingGuidance = !outfitIdentityAcknowledged
-    ? ["confirm identity-preserving upload guidance"]
-    : [];
-  const batchBlockers = [...batchMissingReferences, ...batchMissingAnalyses, ...batchMissingGuidance];
+  const batchBlockers = [...batchMissingReferences, ...batchMissingAnalyses];
 
   function isOutfitStyleStep(step: PortraitAnalysisStep) {
     return step.title === "Outfit Style Guide";
@@ -421,9 +417,6 @@ export default function Home() {
     }
     if (step.requires.body && !bodyAnalysis) {
       blockers.push("body analysis");
-    }
-    if (isOutfitStyleStep(step) && !outfitIdentityAcknowledged) {
-      blockers.push("confirm identity-preserving upload guidance");
     }
     return blockers;
   }
@@ -1453,7 +1446,6 @@ export default function Home() {
     setError("");
     setNotice("");
     setSelectedPortraitReportIndex(0);
-    setOutfitIdentityAcknowledged(false);
     setPortraitAnalysis(null);
     setBodyAnalysis(null);
     setPortraitHash(null);
@@ -1986,18 +1978,6 @@ export default function Home() {
                           but produce weaker face preservation.
                         </p>
                       </div>
-                      <label className="flex gap-2 text-xs leading-5 text-amber-950">
-                        <input
-                          className="mt-1 h-4 w-4 shrink-0"
-                          checked={outfitIdentityAcknowledged}
-                          onChange={(event) => setOutfitIdentityAcknowledged(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>
-                          I uploaded a close portrait and a full-body photo for
-                          identity-preserving outfit results.
-                        </span>
-                      </label>
                     </div>
                   ) : null}
 
@@ -2113,17 +2093,11 @@ export default function Home() {
                       </span>
                     ) : null}
                   </p>
-                  <label className="flex gap-2 rounded-md border border-amber-300 bg-white/70 p-3 text-xs leading-5">
-                    <input
-                      className="mt-1 h-4 w-4 shrink-0"
-                      checked={outfitIdentityAcknowledged}
-                      onChange={(event) => setOutfitIdentityAcknowledged(event.target.checked)}
-                      type="checkbox"
-                    />
-                    <span>
-                      I uploaded a close portrait and full-body photo for the Outfit Style report.
-                    </span>
-                  </label>
+                  <p className="rounded-md border border-amber-300 bg-white/70 p-3 text-xs leading-5">
+                    Outfit Style uses the portrait for face identity and the full-body photo for
+                    body proportions. A close portrait with eyes open gives better identity
+                    preservation than a wide selfie.
+                  </p>
                   <div className="grid gap-2 sm:grid-cols-2">
                     <button
                       type="button"
