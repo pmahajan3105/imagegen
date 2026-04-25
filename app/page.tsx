@@ -41,7 +41,6 @@ import {
 import {
   PORTRAIT_ANALYSIS_STEPS,
   type ImageReference,
-  type OutfitStyleMode,
   type PortraitAnalysisStep
 } from "./lib/portraitSteps";
 import { fetchReferenceFile, referenceUrlFor } from "./lib/referenceImages";
@@ -336,8 +335,6 @@ export default function Home() {
   const [apiKey, setApiKey] = useState("");
   const [appMode] = useState<AppMode>("portrait");
   const [selectedPortraitReportIndex, setSelectedPortraitReportIndex] = useState(0);
-  const [outfitStyleMode, setOutfitStyleMode] =
-    useState<OutfitStyleMode>("identity-preserving");
   const [outfitIdentityAcknowledged, setOutfitIdentityAcknowledged] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [improvementPrompt, setImprovementPrompt] = useState("");
@@ -390,7 +387,6 @@ export default function Home() {
   const hasPreviousImage = Boolean(latestImageBase64);
   const activePortraitStep = PORTRAIT_ANALYSIS_STEPS[selectedPortraitReportIndex];
   const isPortraitMode = appMode === "portrait";
-  const isIdentityPreservingOutfitMode = outfitStyleMode === "identity-preserving";
   const generatedReportTitles = useMemo(
     () => new Set(history.map((entry) => entry.title)),
     [history]
@@ -406,21 +402,13 @@ export default function Home() {
   const batchMissingAnalyses: string[] = [];
   if (!portraitAnalysis) batchMissingAnalyses.push("portrait analysis");
   if (batchNeedsBody && !bodyAnalysis) batchMissingAnalyses.push("body analysis");
-  const batchMissingGuidance =
-    isIdentityPreservingOutfitMode && !outfitIdentityAcknowledged
-      ? ["identity-preserving portrait check"]
-      : [];
+  const batchMissingGuidance = !outfitIdentityAcknowledged
+    ? ["confirm identity-preserving upload guidance"]
+    : [];
   const batchBlockers = [...batchMissingReferences, ...batchMissingAnalyses, ...batchMissingGuidance];
 
   function isOutfitStyleStep(step: PortraitAnalysisStep) {
     return step.title === "Outfit Style Guide";
-  }
-
-  function isStepReady(step: PortraitAnalysisStep): boolean {
-    if (step.requires.portrait && !portraitAnalysis) return false;
-    if (step.requires.body && !bodyAnalysis) return false;
-    if (!getReferenceImage(step.reference)) return false;
-    return true;
   }
 
   function stepBlockers(step: PortraitAnalysisStep): string[] {
@@ -434,14 +422,14 @@ export default function Home() {
     if (step.requires.body && !bodyAnalysis) {
       blockers.push("body analysis");
     }
-    if (isOutfitStyleStep(step) && isIdentityPreservingOutfitMode && !outfitIdentityAcknowledged) {
-      blockers.push("identity-preserving portrait check");
+    if (isOutfitStyleStep(step) && !outfitIdentityAcknowledged) {
+      blockers.push("confirm identity-preserving upload guidance");
     }
     return blockers;
   }
 
-  const activePortraitStepReady = activePortraitStep ? isStepReady(activePortraitStep) : false;
   const activePortraitStepBlockers = activePortraitStep ? stepBlockers(activePortraitStep) : [];
+  const activePortraitStepReady = activePortraitStep ? activePortraitStepBlockers.length === 0 : false;
 
   const actionLabel = isPortraitMode
     ? activePortraitStep
@@ -827,8 +815,7 @@ export default function Home() {
       if (isPortraitMode && reportImage && activePortraitStep && portraitAnalysis) {
         const stepPrompt = activePortraitStep.buildPrompt({
           portrait: portraitAnalysis,
-          body: bodyAnalysis ?? undefined,
-          outfitStyleMode
+          body: bodyAnalysis ?? undefined
         });
         const imageInputs = await buildReportImageInputs(activePortraitStep, reportImage);
         imageBase64 = await editImage(imageInputs, stepPrompt, signal);
@@ -965,8 +952,7 @@ export default function Home() {
 
         const stepPrompt = step.buildPrompt({
           portrait: portraitAnalysis,
-          body: bodyAnalysis ?? undefined,
-          outfitStyleMode
+          body: bodyAnalysis ?? undefined
         });
         const imageInputs = await buildReportImageInputs(step, referenceImage);
         const imageBase64 = await editImage(imageInputs, stepPrompt, signal);
@@ -1467,6 +1453,7 @@ export default function Home() {
     setError("");
     setNotice("");
     setSelectedPortraitReportIndex(0);
+    setOutfitIdentityAcknowledged(false);
     setPortraitAnalysis(null);
     setBodyAnalysis(null);
     setPortraitHash(null);
@@ -1986,6 +1973,34 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {isOutfitStyleStep(activePortraitStep) ? (
+                    <div className="space-y-3 rounded-md border border-amber-200 bg-amber-50 p-3">
+                      <div>
+                        <h2 className="text-sm font-medium text-amber-950">
+                          Outfit identity requirements
+                        </h2>
+                        <p className="mt-1 text-xs leading-5 text-amber-950">
+                          This report renders photorealistic outfit portraits of the same person.
+                          Use a close front-facing portrait with eyes open, face large in frame,
+                          natural light, and a full-body photo. Wide selfies can work for analysis
+                          but produce weaker face preservation.
+                        </p>
+                      </div>
+                      <label className="flex gap-2 text-xs leading-5 text-amber-950">
+                        <input
+                          className="mt-1 h-4 w-4 shrink-0"
+                          checked={outfitIdentityAcknowledged}
+                          onChange={(event) => setOutfitIdentityAcknowledged(event.target.checked)}
+                          type="checkbox"
+                        />
+                        <span>
+                          I uploaded a close portrait and a full-body photo for
+                          identity-preserving outfit results.
+                        </span>
+                      </label>
+                    </div>
+                  ) : null}
+
                   <div className="space-y-4">
                     <div>
                       <h2 className="text-sm font-medium">Uploads</h2>
@@ -2098,6 +2113,17 @@ export default function Home() {
                       </span>
                     ) : null}
                   </p>
+                  <label className="flex gap-2 rounded-md border border-amber-300 bg-white/70 p-3 text-xs leading-5">
+                    <input
+                      className="mt-1 h-4 w-4 shrink-0"
+                      checked={outfitIdentityAcknowledged}
+                      onChange={(event) => setOutfitIdentityAcknowledged(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>
+                      I uploaded a close portrait and full-body photo for the Outfit Style report.
+                    </span>
+                  </label>
                   <div className="grid gap-2 sm:grid-cols-2">
                     <button
                       type="button"

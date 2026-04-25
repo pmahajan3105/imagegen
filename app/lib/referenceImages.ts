@@ -1,7 +1,7 @@
 // Maps each report title to a layout reference image hosted at /references/<file>.
-// The reference image is sent as the LAST input to gpt-image-2 alongside the user's portrait.
-// Prompt language directs the model to use the reference for layout/style structure only,
-// and the user portrait for identity.
+// When present, the reference image is sent as the LAST input to gpt-image-2.
+// Prompt language directs the model to use it for layout/style structure only,
+// while user-uploaded images remain the source for identity, body, or hand details.
 
 const REFERENCE_BY_TITLE: Record<string, string> = {
   // Keep references only where they do not contain a face/body the model could copy.

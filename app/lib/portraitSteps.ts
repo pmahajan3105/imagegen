@@ -1,12 +1,10 @@
 import type { PortraitAnalysis, BodyAnalysis, Swatch } from "./analysis";
 
 export type ImageReference = "portrait" | "body" | "hand";
-export type OutfitStyleMode = "identity-preserving" | "styling-board";
 
 export type PortraitStepInput = {
   portrait: PortraitAnalysis;
   body?: BodyAnalysis;
-  outfitStyleMode?: OutfitStyleMode;
 };
 
 export type PortraitAnalysisStep = {
@@ -681,33 +679,26 @@ ${verdictLines}`,
     description: "Five full-body outfits tailored to the body shape and seasonal palette.",
     reference: "body",
     requires: { portrait: true, body: true },
-    buildPrompt: ({ portrait, body, outfitStyleMode = "identity-preserving" }) => {
+    buildPrompt: ({ portrait, body }) => {
       if (!body) {
         return "Body analysis missing. Cannot generate Outfit Style Guide.";
       }
       const swatchList = (list: Swatch[]) =>
         list.map((s) => `${s.name} ${s.hex}`).join(", ");
       const outfitGuidance = outfitPresentationGuidance(portrait);
-      const isIdentityPreserving = outfitStyleMode === "identity-preserving";
 
       return compose([
         imageRoles(null, {
           primaryReference: "the user's primary portrait",
           primaryUse:
-            isIdentityPreserving
-              ? "Use it as the FACE IDENTITY, visible presentation, hair, skin tone, hair shape, expression family, and styling anchor for every photorealistic outfit portrait."
-              : "Use it as the FACE IDENTITY, visible presentation, hair, skin tone, and styling anchor for the small portrait inset only.",
+            "Use it as the FACE IDENTITY, visible presentation, hair, skin tone, hair shape, expression family, and styling anchor for every photorealistic outfit portrait.",
           intermediateReferences:
-            isIdentityPreserving
-              ? "Any images after Image 1 include optional additional portrait angles followed by the user's FULL-BODY PHOTO. Use additional portraits to stabilize face identity. Use the final user image as the BODY PROPORTIONS, FULL-BODY SILHOUETTE, posture, and scale reference for every full-body outfit portrait."
-              : "Any images after Image 1 include optional additional portrait angles followed by the user's FULL-BODY PHOTO. Use the final user image only for body proportions and silhouette rules, not as a face source.",
+            "Any images after Image 1 include optional additional portrait angles followed by the user's FULL-BODY PHOTO. Use additional portraits to stabilize face identity. Use the final user image as the BODY PROPORTIONS, FULL-BODY SILHOUETTE, posture, and scale reference for every full-body outfit portrait.",
           separationRule:
             "do NOT copy the body, outfit, pose, measurements, or person from the layout reference"
         }),
         personLock(portrait),
-        isIdentityPreserving
-          ? "Generate a 1024x1536 photorealistic identity-preserving Outfit Style Guide. Show the same real person from the uploaded portrait wearing five different outfits. This mode prioritizes face identity and body proportion preservation over fashion-illustration polish."
-          : "Generate a 1024x1536 outfit style guide using the written layout instructions for structure. This is a styling-board report: do NOT create photorealistic full-body portraits of the user. Use a small identity-preserved portrait inset plus outfit cutouts, flat lays, or faceless neutral mannequin silhouettes so the user's face and body are not distorted.",
+        "Generate a 1024x1536 photorealistic identity-preserving Outfit Style Guide. Show the same real person from the uploaded portrait wearing five different outfits. Prioritize face identity and body proportion preservation over fashion-illustration polish.",
         `Use these analysis values exactly. Do not re-derive them:
 - Body shape: ${body.bodyShape.value}
 - Silhouette rules: ${body.silhouetteRules.join(", ")}
@@ -719,60 +710,33 @@ ${verdictLines}`,
 - Accent colors (use sparingly): ${swatchList(portrait.palette.accentColors)}
 - Avoid (do NOT use): ${swatchList(portrait.palette.avoid)}`,
         outfitGuidance,
-        isIdentityPreserving
-          ? `LAYOUT (identity-preserving mode, build from these instructions, no layout reference image):
+        `LAYOUT (identity-preserving mode, build from these instructions, no layout reference image):
 - Top band: small-caps eyebrow "OUTFIT STYLE" + title "Identity-Preserving Outfit Guide" + a thin divider below.
 - Main region: 5 photorealistic full-body outfit portraits arranged in a single horizontal row of 5 columns. Each column shows the SAME person from Image 1, using body proportions from the full-body photo. The person has the same face, hair, skin tone, facial features, visible presentation, and natural body scale in every column. Only the outfit changes.
 - Use the final user image only for body proportions and stance reference. Do not widen, slim, lengthen, shorten, or glamorize the body. Do not change the person's apparent weight.
 - Outfit variety across the 5 columns, all derived from uploaded references, ${portrait.presentation.value} visible presentation, and silhouette rules: one casual everyday, one polished workwear, one elevated occasion look, one smart-casual layered look, and one weekend or evening look. Compose specific garments dynamically. Do NOT default to fixed fashion archetypes.
 - Every garment color must use an exact hex from the approved swatches. Hardware (belts, buckles, jewelry) is rendered in ${portrait.bestMetal.value}.
 - Below each column: a short outfit label in 1-3 words and one tiny color dot matching a key garment color.
-- Bottom band: a horizontal "Key:" line with 5 short principles in 11px sans-serif, separated by small bullet dots. One principle per outfit, composed dynamically from the silhouette rules and season. Keep each under 5 words (examples of shape: "Defined waist", "Clean structure", "Rich colors", "Balanced proportions", "Best metal").`
-          : `LAYOUT (styling-board mode, build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "OUTFIT STYLE" + a thin divider below. Include a small rounded portrait inset from Image 1 at the left; preserve the user's face identity in this inset only.
-- Main region: 5 outfit columns arranged in a single horizontal row. Each column shows one complete head-to-toe outfit as product cutouts, flat-lay garments, or a faceless neutral mannequin silhouette. Do NOT render the user's face in the outfit columns. Do NOT alter the user's body size. Use body analysis only to choose flattering silhouettes.
-- Outfit variety across the 5 columns, all appropriate to ${portrait.presentation.value} presentation: one casual everyday, one polished workwear, one elevated occasion look, one smart-casual layered look, and one weekend or evening look. Compose specific outfits dynamically from the uploaded references and analysis values. Do NOT default to fashion archetypes from any generic reference.
-- Every garment color must use an exact hex from the approved swatches. Hardware (belts, buckles, jewelry) is rendered in ${portrait.bestMetal.value}.
 - Bottom band: a horizontal "Key:" line with 5 short principles in 11px sans-serif, separated by small bullet dots. One principle per outfit, composed dynamically from the silhouette rules and season. Keep each under 5 words (examples of shape: "Defined waist", "Clean structure", "Rich colors", "Balanced proportions", "Best metal").`,
         STYLE_BLOCK,
-        isIdentityPreserving
-          ? `Hard rules:
+        `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
 - Identity preservation is mandatory: same face, same hair, same skin tone, same age, same visible presentation, same body proportions across all 5 outfit portraits.
 - Do not exaggerate body size, weight, width, height, waist, chest, hips, or legs. No weight claims or body criticism.
-- Do not make the person look like a generic model, influencer, celebrity, mannequin, or the layout-reference subject.
+- Do not make the person look like a generic model, influencer, celebrity, mannequin, or reference-image subject.
 - Every garment color uses an exact hex from the approved swatches above. Never use an Avoid color.
 - Hardware is consistently in ${portrait.bestMetal.value}.
 - No brand names, no prices, no fake product codes.
 - Compose outfits from the user's visible presentation, uploaded references, body analysis, and color analysis. Do not default to dresses, suits, skirts, heels, or any fixed fashion archetype.
-- Do not mention that this is AI-generated.`
-          : `Hard rules:
-- All text must be legible English. No gibberish, no warped letters.
-- Outfit columns are product cutouts, flat lays, or faceless neutral mannequins. Do not render the user's face in the outfit columns.
-- Do not exaggerate body size, weight, width, or proportions. No weight claims or body criticism.
-- Every garment color uses an exact hex from the approved swatches above. Never use an Avoid color.
-- Hardware is consistently in ${portrait.bestMetal.value}.
-- No brand names, no prices, no fake product codes.
-- Do NOT copy outfit ideas, color choices, or principle text from the layout reference. Compose them for this user.
 - Do not mention that this is AI-generated.`,
-        preserveRepeat(
-          isIdentityPreserving
-            ? [
-                "Five full-body outfit portraits in a single row.",
-                "Same person in every outfit portrait: face from Image 1, body proportions from the full-body photo.",
-                "Do not alter or exaggerate the user's body size or shape.",
-                "Every garment color matches one of the approved hex values; no Avoid colors anywhere.",
-                "Hardware across the entire image is rendered in " + portrait.bestMetal.value + ".",
-                "Bottom key line has exactly 5 principles, one per outfit, under 5 words each."
-              ]
-            : [
-                "Five outfit columns in a single row.",
-                "Outfit columns do not render the user's face; only the small portrait inset uses Image 1 identity.",
-                "Every garment color matches one of the approved hex values; no Avoid colors anywhere.",
-                "Hardware across the entire image is rendered in " + portrait.bestMetal.value + ".",
-                "Bottom key line has exactly 5 principles, one per outfit, under 5 words each."
-              ]
-        )
+        preserveRepeat([
+          "Five full-body outfit portraits in a single row.",
+          "Same person in every outfit portrait: face from Image 1, body proportions from the full-body photo.",
+          "Do not alter or exaggerate the user's body size or shape.",
+          "Every garment color matches one of the approved hex values; no Avoid colors anywhere.",
+          "Hardware across the entire image is rendered in " + portrait.bestMetal.value + ".",
+          "Bottom key line has exactly 5 principles, one per outfit, under 5 words each."
+        ])
       ]);
     }
   },
