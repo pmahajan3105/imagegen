@@ -1,6 +1,6 @@
 # imagegen
 
-A browser-only Next.js 16 app that drives OpenAI's image generation API directly from the client using a user-supplied API key. The current default (and only selectable) flow is a multi-step **portrait analysis** pipeline — color season, face shape, hairstyles, wardrobe capsule, makeup, etc.
+A browser-only Next.js 16 app that drives OpenAI's image generation API directly from the client using a user-supplied API key. The current default (and only selectable) flow is a multi-step **portrait analysis** pipeline — palette calibration, palette direction, face shape, hairstyles, wardrobe capsule, makeup, etc.
 
 Personal-use tool. There is no backend. The user's API key is sent directly from the browser to `api.openai.com`.
 
@@ -28,7 +28,8 @@ app/
     persistence.ts      IndexedDB helpers (history + cached analyses)
     analysis.ts         Portrait / body analysis types and helpers
     referenceImages.ts  Static reference images bundled with each step
-public/references/      Reference images shown in the UI (color season chart, face shape chart, etc.)
+public/references/      Optional layout references for non-identity-critical reports
+docs/                   Product and report strategy notes
 ```
 
 Path aliases are **not** configured. All imports are relative.
@@ -48,7 +49,24 @@ Three independent file inputs feed the pipeline:
 - `bodyInputRef` — full-body shot
 - `handInputRef` — hand photo
 
-`handleGenerateAllReports` runs the entire pipeline sequentially.
+`handleGenerateAllReports` runs the visible pipeline sequentially. Some prompt entries remain in `PORTRAIT_ANALYSIS_STEPS` but are hidden from the active UI through `VISIBLE_PORTRAIT_ANALYSIS_STEPS` in `app/page.tsx`.
+
+### Report strategy
+
+The palette flow is intentionally split:
+
+- `Palette Calibration` is the evidence/testing report. It compares colors near the face and appears first.
+- `Palette Direction Report` is the summary report. It should be phrased as a likely palette direction, not as a definitive color-season diagnosis.
+
+Hidden reports:
+
+- `Nail Color Guide`
+- `Makeup Feature Guide`
+- `Use Carefully Guide`
+
+Do not delete those prompt entries unless the user explicitly asks. They are parked because they are lower priority or overlap with stronger reports.
+
+See `docs/style-report-strategy.md` for the rationale and future recommendation-engine plan.
 
 ### Image preprocessing — do not bypass
 
@@ -99,11 +117,11 @@ The `hasLoadedPersistedState` ref gates the save effect so the initial empty ren
 
 ## Adding a new portrait step
 
-1. Append a new entry to `PORTRAIT_ANALYSIS_STEPS` in `app/lib/portraitSteps.ts` with `title`, `prompt`, and `reference` (`"portrait" | "body" | "hand"`).
+1. Append a new entry to `PORTRAIT_ANALYSIS_STEPS` in `app/lib/portraitSteps.ts` with `title`, `description`, `reference` (`"portrait" | "body" | "hand"`), `requires`, and `buildPrompt`.
 2. If it needs a new reference image, drop it in `public/references/` and wire it through `app/lib/referenceImages.ts`.
-3. The pipeline picks it up automatically — `handleGenerateAllReports` iterates the array.
+3. Decide whether it should be visible. The active UI and Generate All flow use `VISIBLE_PORTRAIT_ANALYSIS_STEPS` in `app/page.tsx`, not the full prompt array.
 
-No other changes are needed for the request side; UI listing is also data-driven.
+No other changes are needed for the request side; UI listing is data-driven from the visible step list.
 
 ## Stack
 

@@ -141,8 +141,8 @@ function compose(parts: Array<string | null | undefined>) {
 
 export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
   {
-    title: "Color Season Report",
-    description: "Polished color analysis showing depth, contrast, undertone, palette, and metals.",
+    title: "Palette Direction Report",
+    description: "Polished summary of the most likely palette direction, colors, and metals.",
     reference: "portrait",
     requires: { portrait: true },
     buildPrompt: ({ portrait }) => {
@@ -152,25 +152,25 @@ export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
       return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic personal color analysis infographic, using the user's portrait(s) for identity and the written layout instructions for structure.",
+        "Generate a 1024x1536 photorealistic Palette Direction Report infographic, using the user's portrait(s) for identity and the written layout instructions for structure. Frame the palette as the most likely direction from the analysis, not as a definitive diagnosis.",
         `Use these analysis values exactly. Do not re-derive them:
 - Depth: ${portrait.depth.value}
 - Contrast: ${portrait.contrast.value}
 - Undertone: ${portrait.undertone.displayLabel}
-- Season: ${portrait.colorSeason.value}
-- Season feel: ${portrait.colorSeason.description}`,
+- Most likely palette direction: ${portrait.colorSeason.value}
+- Palette feel: ${portrait.colorSeason.description}`,
         `Available swatches. Use the exact hex values when rendering circles or color bands:
 - Signature colors: ${swatchList(portrait.palette.signatureColors)}
 - Accent colors: ${swatchList(portrait.palette.accentColors)}
 - Best neutrals: ${swatchList(portrait.palette.bestNeutrals)}
 - Avoid: ${swatchList(portrait.palette.avoid)}`,
         `LAYOUT (build from these instructions, no layout reference image):
-- Region structure: a top "key features" band, a try-on grid of portrait tiles, a "best palette" card with the season name and a circle palette, and a bottom band of swatch rows.
+- Region structure: a top "key features" band, a small supporting try-on grid of portrait tiles, a "palette direction" card with the most likely palette name and a circle palette, and a bottom band of swatch rows.
 - Header bar: render exactly the user's values: "${portrait.depth.value}" / "${portrait.contrast.value}" / "${portrait.undertone.displayLabel}".
 - Try-on tiles: render the SAME user (from Image 1) in each tile wearing only a solid top in a chosen color. Pick 4 flattering tile colors from the user's Signature/Accent swatches and 2 less-harmonious tile colors from the user's Avoid swatches. Vary the flattering picks across depth and saturation.
 - Beneath each tile, render a colored band matching the tile's hex, the swatch name in small caps, and a 2-3 word verdict caption that you compose for this specific user and swatch (positive for flattering, neutral-descriptive for less-harmonious, never insulting).
-- Where the reference has a "Best Palette" card, render: "YOUR BEST PALETTE" eyebrow, the season name "${portrait.colorSeason.value}" in large bold serif, a 1-2 line tagline derived from the season feel, then a 12-circle palette in 3x4 (curated from the user's Signature + Accent swatches, no labels).
-- Where the reference has bottom swatch rows, render "BEST NEUTRALS" (5-7 circles from the user's Best Neutrals) and "AVOID" (5-7 circles from the user's Avoid), each circle labeled with its swatch name in small caps below. Add a single concluding line composed for the user.`,
+- Where the reference has a "Best Palette" card, render: "PALETTE DIRECTION" eyebrow, the phrase "Most likely: ${portrait.colorSeason.value}" in large bold serif, a 1-2 line tagline derived from the palette feel, then a 12-circle palette in 3x4 (curated from the user's Signature + Accent swatches, no labels).
+- Where the reference has bottom swatch rows, render "BEST NEUTRALS" (5-7 circles from the user's Best Neutrals) and "USE CAREFULLY" (5-7 circles from the user's Avoid), each circle labeled with its swatch name in small caps below. Add a single concluding line composed for the user.`,
         tileAnchor("solid top color"),
         STYLE_BLOCK,
         `Hard rules:
@@ -186,7 +186,7 @@ export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
           "Identical head-and-shoulders crop, same camera angle, same neutral expression in every tile.",
           "Identical neutral background and identical soft warm lighting across tiles.",
           "Every rendered color (tile top, swatch circle, color band) uses an exact hex from the swatches list above.",
-          "Season name printed in the right card is exactly: " + portrait.colorSeason.value
+          'Right card headline includes exactly: "Most likely: ' + portrait.colorSeason.value + '"'
         ])
       ]);
     }
@@ -334,8 +334,8 @@ export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
     }
   },
   {
-    title: "Color Try-On Comparison",
-    description: "Eight portrait try-on tiles comparing flattering, good, and skip colors.",
+    title: "Palette Calibration",
+    description: "Evidence board comparing colors near the face before trusting a palette direction.",
     reference: "portrait",
     requires: { portrait: true },
     buildPrompt: ({ portrait }) => {
@@ -345,7 +345,7 @@ export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
       return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic color try-on comparison board, using the user's portrait(s) for identity and the written layout instructions for structure. The page is focused on color comparison; do not include a separate palette card or full neutrals/avoid rows (those belong to the Color Season Report).",
+        "Generate a 1024x1536 photorealistic Palette Calibration board, using the user's portrait(s) for identity and the written layout instructions for structure. This is the evidence/testing report before trusting a palette direction. The page is focused on color comparison; do not include a separate palette card or full neutrals/avoid rows (those belong to the Palette Direction Report).",
         `Use these analysis values exactly. Do not re-derive them:
 - Depth: ${portrait.depth.value}
 - Contrast: ${portrait.contrast.value}
@@ -355,7 +355,7 @@ export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
 - Accent colors (use 2 for Good tiles): ${swatchList(portrait.palette.accentColors)}
 - Avoid (use 3 for Skip tiles): ${swatchList(portrait.palette.avoid)}`,
         `LAYOUT (build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "COLOR TRY-ON" and a thin horizontal divider below.
+- Top band: small-caps eyebrow "PALETTE CALIBRATION" and a thin horizontal divider below.
 - Main region: 8 photorealistic portrait try-on tiles arranged in a 4-column by 2-row grid. Each tile shows the SAME person from Image 1, head-and-shoulders, wearing only a solid top in that tile's color.
 - Tile composition (8 tiles total):
   - Pick 3 Signature swatches yourself for "Best" tiles. Vary depth and saturation across the 3 picks.

@@ -52,6 +52,21 @@ const MODEL = "gpt-image-2";
 const QUALITY = "high";
 const SIZE = "1024x1536";
 const OUTPUT_FORMAT = "png";
+const HIDDEN_REPORT_TITLES = new Set([
+  "Nail Color Guide",
+  "Makeup Feature Guide",
+  "Use Carefully Guide"
+]);
+const VISIBLE_REPORT_ORDER = new Map([
+  ["Palette Calibration", 0],
+  ["Palette Direction Report", 1]
+]);
+const VISIBLE_PORTRAIT_ANALYSIS_STEPS = PORTRAIT_ANALYSIS_STEPS.filter(
+  (step) => !HIDDEN_REPORT_TITLES.has(step.title)
+).sort(
+  (a, b) =>
+    (VISIBLE_REPORT_ORDER.get(a.title) ?? 100) - (VISIBLE_REPORT_ORDER.get(b.title) ?? 100)
+);
 
 type AppMode = "freeform" | "portrait";
 
@@ -120,11 +135,11 @@ function makeDownloadName(title: string) {
 
 function getReportShortTitle(title: string) {
   const titleMap: Record<string, string> = {
-    "Color Season Report": "Color Report",
+    "Palette Calibration": "Calibration",
+    "Palette Direction Report": "Palette Report",
     "Face Shape And Feature Map": "Face Map",
     "Best Hairstyles Board": "Hairstyle Board",
     "Wardrobe Capsule Board": "Wardrobe Board",
-    "Color Try-On Comparison": "Color Try-On",
     "Makeup Shade Guide": "Makeup Guide",
     "Nail Color Guide": "Nail Guide",
     "Accessory & Jewelry Metals Guide": "Metals Guide",
@@ -384,7 +399,7 @@ export default function Home() {
         }
       : null);
   const hasPreviousImage = Boolean(latestImageBase64);
-  const activePortraitStep = PORTRAIT_ANALYSIS_STEPS[selectedPortraitReportIndex];
+  const activePortraitStep = VISIBLE_PORTRAIT_ANALYSIS_STEPS[selectedPortraitReportIndex];
   const isPortraitMode = appMode === "portrait";
   const generatedReportTitles = useMemo(
     () => new Set(history.map((entry) => entry.title)),
@@ -392,12 +407,12 @@ export default function Home() {
   );
   const batchMissingReferences = Array.from(
     new Set(
-      PORTRAIT_ANALYSIS_STEPS.filter((step) => !getReferenceImage(step.reference)).map((step) =>
+      VISIBLE_PORTRAIT_ANALYSIS_STEPS.filter((step) => !getReferenceImage(step.reference)).map((step) =>
         getReferenceLabel(step.reference)
       )
     )
   );
-  const batchNeedsBody = PORTRAIT_ANALYSIS_STEPS.some((step) => step.requires.body);
+  const batchNeedsBody = VISIBLE_PORTRAIT_ANALYSIS_STEPS.some((step) => step.requires.body);
   const batchMissingAnalyses: string[] = [];
   if (!portraitAnalysis) batchMissingAnalyses.push("portrait analysis");
   if (batchNeedsBody && !bodyAnalysis) batchMissingAnalyses.push("body analysis");
@@ -918,7 +933,7 @@ export default function Home() {
     const failedTitles: string[] = [];
     let lastErrorMessage = "";
 
-    for (const [index, step] of PORTRAIT_ANALYSIS_STEPS.entries()) {
+    for (const [index, step] of VISIBLE_PORTRAIT_ANALYSIS_STEPS.entries()) {
       if (!isCurrentRun(runId)) {
         return;
       }
@@ -928,7 +943,7 @@ export default function Home() {
         setGeneratingReportTitle(step.title);
         setNotice(
           `Generating ${getReportShortTitle(step.title)} (${index + 1} / ${
-            PORTRAIT_ANALYSIS_STEPS.length
+            VISIBLE_PORTRAIT_ANALYSIS_STEPS.length
           })...`
         );
 
@@ -1935,11 +1950,11 @@ export default function Home() {
                         const nextIndex = Number(event.target.value);
                         setSelectedPortraitReportIndex(nextIndex);
                         setError("");
-                        setNotice(`${PORTRAIT_ANALYSIS_STEPS[nextIndex].title} selected.`);
+                        setNotice(`${VISIBLE_PORTRAIT_ANALYSIS_STEPS[nextIndex].title} selected.`);
                       }}
                       disabled={isLoading}
                     >
-                      {PORTRAIT_ANALYSIS_STEPS.map((step, index) => (
+                      {VISIBLE_PORTRAIT_ANALYSIS_STEPS.map((step, index) => (
                         <option key={step.title} value={index}>
                           {step.title}
                         </option>
@@ -2006,14 +2021,12 @@ export default function Home() {
                             "Required for Body Shape Guide, Outfit Style Guide, and Generate All. Use a standing photo with the full silhouette visible. Face identity still comes from the portrait photo."
                         })
                       : null}
-                    {activePortraitStep.reference === "hand" ||
-                    showGenerateAllConfirm ||
-                    isBatchGenerating
+                    {activePortraitStep.reference === "hand"
                       ? renderUploadSlot({
                           reference: "hand",
                           title: "Hand photo",
                           helpText:
-                            "Required for Nail Color Guide and Generate All. Use a clear hand photo in natural light with fingers and skin tone visible."
+                            "Required for Nail Color Guide. Use a clear hand photo in natural light with fingers and skin tone visible."
                         })
                       : null}
                   </div>
@@ -2081,12 +2094,12 @@ export default function Home() {
                   <div>
                     <h3 className="font-medium">Generate all reports</h3>
                     <p className="mt-1 leading-6">
-                      This will generate {PORTRAIT_ANALYSIS_STEPS.length} reports. Estimated time:
-                      around 20-30 minutes. Keep this tab open.
+                      This will generate {VISIBLE_PORTRAIT_ANALYSIS_STEPS.length} reports. Estimated time:
+                      around 15-25 minutes. Keep this tab open.
                     </p>
                   </div>
                   <p className="text-xs leading-5">
-                    Requires portrait, full-body, and hand photos plus their analyses.
+                    Requires portrait and full-body photos plus their analyses.
                     {batchBlockers.length ? (
                       <span className="ml-1 font-medium">
                         Missing: {batchBlockers.join(", ")}.
@@ -2135,7 +2148,7 @@ export default function Home() {
                     <div>
                       <h3 className="font-medium">Batch progress</h3>
                       <p className="text-xs leading-5 text-[var(--muted-foreground)]">
-                        {batchCompletedCount} / {PORTRAIT_ANALYSIS_STEPS.length} complete
+                        {batchCompletedCount} / {VISIBLE_PORTRAIT_ANALYSIS_STEPS.length} complete
                         {generatingReportTitle ? `, now ${generatingReportTitle}` : ""}.
                       </p>
                     </div>
