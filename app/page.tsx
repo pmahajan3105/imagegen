@@ -21,11 +21,26 @@ import {
   deleteCachedAnalysis,
   getCachedAnalysis,
   loadPersistedState,
+  loadPortraitMetadata,
   saveCachedAnalysis,
+  saveLockedPalette,
   savePersistedState,
+  saveUserProfileContext,
   type HistoryEntry,
   type PreviewImage
 } from "./lib/persistence";
+import {
+  EMPTY_SESSION_CONTEXT,
+  EMPTY_USER_PROFILE_CONTEXT,
+  type Climate,
+  type HairChangeTolerance,
+  type MaintenanceTolerance,
+  type OccasionId,
+  type SessionContext,
+  type StatedPresentation,
+  type UserProfileContext
+} from "./lib/userContext";
+import type { LockedPalette } from "./lib/paletteTypes";
 import {
   AnalysisRefusedError,
   AnalysisSchemaError,
@@ -40,10 +55,10 @@ import {
 } from "./lib/analysis";
 import {
   PORTRAIT_ANALYSIS_STEPS,
+  reorderForLock,
   type ImageReference,
   type PortraitAnalysisStep
 } from "./lib/portraitSteps";
-import { fetchReferenceFile, referenceUrlFor } from "./lib/referenceImages";
 
 const API_KEY_STORAGE_KEY = "personal-gpt-image-api-key";
 const OPENAI_IMAGE_GENERATIONS_URL = "https://api.openai.com/v1/images/generations";
@@ -52,11 +67,15 @@ const MODEL = "gpt-image-2";
 const QUALITY = "high";
 const SIZE = "1024x1536";
 const OUTPUT_FORMAT = "png";
-const HIDDEN_REPORT_TITLES = new Set([
-  "Nail Color Guide",
-  "Makeup Feature Guide",
-  "Use Carefully Guide"
-]);
+const HIDDEN_REPORT_TITLES = new Set<string>();
+const STYLE_PREFERENCE_CHOICES = [
+  "casual",
+  "classic",
+  "minimal",
+  "workwear",
+  "bold",
+  "street"
+] as const;
 const VISIBLE_REPORT_ORDER = new Map([
   ["Palette Calibration", 0],
   ["Palette Direction Report", 1]
@@ -137,18 +156,19 @@ function getReportShortTitle(title: string) {
   const titleMap: Record<string, string> = {
     "Palette Calibration": "Calibration",
     "Palette Direction Report": "Palette Report",
-    "Face Shape And Feature Map": "Face Map",
+    "Face Balance Map": "Face Map",
     "Best Hairstyles Board": "Hairstyle Board",
     "Wardrobe Capsule Board": "Wardrobe Board",
     "Makeup Shade Guide": "Makeup Guide",
-    "Nail Color Guide": "Nail Guide",
     "Accessory & Jewelry Metals Guide": "Metals Guide",
     "Eyeglasses / Frames Guide": "Frames Guide",
-    "Body Shape Guide": "Body Guide",
-    "Outfit Style Guide": "Outfit Guide",
-    "Makeup Feature Guide": "Feature Makeup",
-    "Use Carefully Guide": "Use Carefully"
+    "Silhouette Balance Guide": "Silhouette Guide",
+    "Outfit Style Guide": "Outfit Guide"
   };
+  // Retired reports (no longer in PORTRAIT_ANALYSIS_STEPS):
+  //   - "Nail Color Guide" → "Nail Guide" (required hand photo, legacy palette)
+  //   - "Makeup Feature Guide" → "Feature Makeup" (replaced by Makeup Shade Guide rewrite)
+  //   - "Use Carefully Guide" → "Use Carefully" (folded into Palette Direction Report)
 
   return titleMap[title] ?? title;
 }
@@ -337,7 +357,6 @@ function buildFollowUpPrompt(prompt: string) {
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const bodyInputRef = useRef<HTMLInputElement | null>(null);
-  const handInputRef = useRef<HTMLInputElement | null>(null);
   const hasLoadedPersistedState = useRef(false);
   const activeRunIdRef = useRef(0);
   const activeAbortControllerRef = useRef<AbortController | null>(null);
@@ -358,8 +377,6 @@ export default function Home() {
   const [additionalPortraitPreviews, setAdditionalPortraitPreviews] = useState<string[]>([]);
   const [bodyImage, setBodyImage] = useState<File | null>(null);
   const [bodyPreviewUrl, setBodyPreviewUrl] = useState<string | null>(null);
-  const [handImage, setHandImage] = useState<File | null>(null);
-  const [handPreviewUrl, setHandPreviewUrl] = useState<string | null>(null);
   const [latestImageBase64, setLatestImageBase64] = useState<string | null>(null);
   const [selectedPreview, setSelectedPreview] = useState<PreviewImage | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -384,6 +401,11 @@ export default function Home() {
   const [analysisError, setAnalysisError] = useState<AnalysisErrorState | null>(null);
   const [portraitHash, setPortraitHash] = useState<string | null>(null);
   const [bodyHash, setBodyHash] = useState<string | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfileContext>(EMPTY_USER_PROFILE_CONTEXT);
+  const [lockedPalette, setLockedPalette] = useState<LockedPalette | null>(null);
+  const [showPreferencesForm, setShowPreferencesForm] = useState(false);
+  const [session, setSession] = useState<SessionContext>(EMPTY_SESSION_CONTEXT);
+  const userProfileHydratedHashRef = useRef<string | null>(null);
 
   const latestImageUrl = useMemo(
     () => (latestImageBase64 ? imageDataUrl(latestImageBase64) : null),
@@ -452,10 +474,6 @@ export default function Home() {
       return "full-body photo";
     }
 
-    if (reference === "hand") {
-      return "hand photo";
-    }
-
     return "portrait photo";
   }
 
@@ -473,10 +491,6 @@ export default function Home() {
       return bodyImage;
     }
 
-    if (reference === "hand") {
-      return handImage;
-    }
-
     return uploadedImage;
   }
 
@@ -485,20 +499,12 @@ export default function Home() {
       return bodyPreviewUrl;
     }
 
-    if (reference === "hand") {
-      return handPreviewUrl;
-    }
-
     return uploadedPreviewUrl;
   }
 
   function getReferenceInput(reference: ImageReference) {
     if (reference === "body") {
       return bodyInputRef;
-    }
-
-    if (reference === "hand") {
-      return handInputRef;
     }
 
     return fileInputRef;
@@ -510,22 +516,12 @@ export default function Home() {
       return;
     }
 
-    if (reference === "hand") {
-      setHandImage(file);
-      return;
-    }
-
     setUploadedImage(file);
   }
 
   function setReferencePreview(reference: ImageReference, previewUrl: string | null) {
     if (reference === "body") {
       setBodyPreviewUrl(previewUrl);
-      return;
-    }
-
-    if (reference === "hand") {
-      setHandPreviewUrl(previewUrl);
       return;
     }
 
@@ -637,6 +633,45 @@ export default function Home() {
       setNotice("Local history could not be saved in this browser.");
     });
   }, [history]);
+
+  // Hydrate user profile + locked palette when portraitHash changes.
+  useEffect(() => {
+    let cancelled = false;
+    if (!portraitHash) {
+      userProfileHydratedHashRef.current = null;
+      Promise.resolve().then(() => {
+        if (cancelled) return;
+        setUserProfile(EMPTY_USER_PROFILE_CONTEXT);
+        setLockedPalette(null);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    loadPortraitMetadata(portraitHash)
+      .then((meta) => {
+        if (cancelled) return;
+        setUserProfile(meta?.userProfile ?? EMPTY_USER_PROFILE_CONTEXT);
+        setLockedPalette(meta?.lockedPalette ?? null);
+        userProfileHydratedHashRef.current = portraitHash;
+      })
+      .catch(() => {
+        if (cancelled) return;
+        userProfileHydratedHashRef.current = portraitHash;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [portraitHash]);
+
+  // Persist user profile changes (after hydration completes for this hash).
+  useEffect(() => {
+    if (!portraitHash) return;
+    if (userProfileHydratedHashRef.current !== portraitHash) return;
+    saveUserProfileContext(portraitHash, userProfile).catch(() => {
+      setNotice("Preferences could not be saved in this browser.");
+    });
+  }, [portraitHash, userProfile]);
 
   useEffect(() => {
     if (!isLoading || !requestStartedAt) {
@@ -762,6 +797,38 @@ export default function Home() {
     setRequestStartedAt(null);
   }
 
+  function handleLockHypothesis(hypothesisId: string) {
+    if (!portraitHash) return;
+    const next: LockedPalette = {
+      hypothesisId,
+      source: "user",
+      lockedAt: new Date().toISOString()
+    };
+    setLockedPalette(next);
+    saveLockedPalette(portraitHash, next).catch(() => {
+      setNotice("Lock could not be saved in this browser.");
+    });
+  }
+
+  function updateUserProfile<K extends keyof UserProfileContext>(
+    key: K,
+    value: UserProfileContext[K]
+  ) {
+    setUserProfile((current) => ({ ...current, [key]: value }));
+  }
+
+  function toggleSessionOccasion(occasion: OccasionId) {
+    setSession((current) => {
+      const currentList = current.occasions ?? ["work", "casual", "event"];
+      const isSelected = currentList.includes(occasion);
+      const next = isSelected
+        ? currentList.filter((o) => o !== occasion)
+        : [...currentList, occasion];
+      // Empty list means "default to all" — drop the field.
+      return { ...current, occasions: next.length > 0 ? next : undefined };
+    });
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -822,8 +889,11 @@ export default function Home() {
 
       if (isPortraitMode && reportImage && activePortraitStep && portraitAnalysis) {
         const stepPrompt = activePortraitStep.buildPrompt({
-          portrait: portraitAnalysis,
-          body: bodyAnalysis ?? undefined
+          portrait: reorderForLock(portraitAnalysis, lockedPalette),
+          body: bodyAnalysis ?? undefined,
+          userProfile,
+          lockedPalette: lockedPalette ?? undefined,
+          session
         });
         const imageInputs = await buildReportImageInputs(activePortraitStep, reportImage);
         imageBase64 = await editImage(imageInputs, stepPrompt, signal);
@@ -959,8 +1029,11 @@ export default function Home() {
         }
 
         const stepPrompt = step.buildPrompt({
-          portrait: portraitAnalysis,
-          body: bodyAnalysis ?? undefined
+          portrait: reorderForLock(portraitAnalysis, lockedPalette),
+          body: bodyAnalysis ?? undefined,
+          userProfile,
+          lockedPalette: lockedPalette ?? undefined,
+          session
         });
         const imageInputs = await buildReportImageInputs(step, referenceImage);
         const imageBase64 = await editImage(imageInputs, stepPrompt, signal);
@@ -1423,12 +1496,6 @@ export default function Home() {
       }
       inputs.push(baseFile);
     }
-
-    const refUrl = referenceUrlFor(step.title);
-    if (refUrl) {
-      const referenceFile = await fetchReferenceFile(refUrl);
-      inputs.push(referenceFile);
-    }
     return inputs;
   }
 
@@ -1446,8 +1513,6 @@ export default function Home() {
     setAdditionalPortraitPreviews([]);
     setBodyImage(null);
     setBodyPreviewUrl(null);
-    setHandImage(null);
-    setHandPreviewUrl(null);
     setLatestImageBase64(null);
     setSelectedPreview(null);
     setImprovementPrompt("");
@@ -1474,9 +1539,6 @@ export default function Home() {
     }
     if (bodyInputRef.current) {
       bodyInputRef.current.value = "";
-    }
-    if (handInputRef.current) {
-      handInputRef.current.value = "";
     }
   }
 
@@ -1662,12 +1724,11 @@ export default function Home() {
       portraitChips.push({ label: "Depth", value: hedge(p.depth) });
       portraitChips.push({ label: "Contrast", value: hedge(p.contrast) });
       portraitChips.push({ label: "Undertone", value: p.undertone.displayLabel });
+      const locked = p.paletteHypotheses[0];
       portraitChips.push({
         label: "Season",
         value:
-          p.colorSeason.confidence === "high"
-            ? p.colorSeason.value
-            : `${p.colorSeason.value} · most likely`
+          locked.confidence === "high" ? locked.name : `${locked.name} · most likely`
       });
       portraitChips.push({ label: "Face shape", value: hedge(p.faceShape) });
       portraitChips.push({ label: "Best metal", value: hedge(p.bestMetal) });
@@ -1996,6 +2057,118 @@ export default function Home() {
                     </div>
                   ) : null}
 
+                  {isOutfitStyleStep(activePortraitStep) ? (
+                    <div className="space-y-2 rounded-md border border-[var(--border)] bg-[var(--panel-soft)] p-3">
+                      <div>
+                        <h2 className="text-sm font-medium">This run (optional)</h2>
+                        <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                          Per-run, not saved. Subset which occasions render and add a free-text
+                          note like &quot;client meeting, fall&quot;.
+                        </p>
+                      </div>
+                      <div className="space-y-1">
+                        <span className="text-xs font-medium">Occasions in scope</span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(["work", "casual", "event"] as OccasionId[]).map((occ) => {
+                            const list = session.occasions ?? ["work", "casual", "event"];
+                            const checked = list.includes(occ);
+                            return (
+                              <label
+                                key={occ}
+                                className={cx(
+                                  "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                  checked
+                                    ? "border-emerald-400 ring-1 ring-emerald-200"
+                                    : "border-[var(--border)] hover:border-zinc-400"
+                                )}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="h-3 w-3"
+                                  checked={checked}
+                                  onChange={() => toggleSessionOccasion(occ)}
+                                />
+                                <span className="capitalize">{occ}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                        <p className="text-[11px] leading-4 text-[var(--muted-foreground)]">
+                          Default: all three. Uncheck to render fewer columns this run.
+                        </p>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium" htmlFor="session-note">
+                          Free-text note
+                        </label>
+                        <textarea
+                          id="session-note"
+                          className="min-h-12 w-full resize-y rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm leading-5 outline-none transition focus:border-zinc-400 focus:ring-2 focus:ring-zinc-200"
+                          value={session.freeTextNote ?? ""}
+                          onChange={(event) =>
+                            setSession((current) => ({
+                              ...current,
+                              freeTextNote: event.target.value || undefined
+                            }))
+                          }
+                          placeholder="e.g. client meeting, fall — slightly more polished"
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {activePortraitStep.title === "Palette Calibration" &&
+                  portraitAnalysis?.paletteHypotheses?.length ? (
+                    <div className="space-y-2 rounded-md border border-[var(--border)] bg-[var(--panel-soft)] p-3">
+                      <div>
+                        <h2 className="text-sm font-medium">Lock palette direction</h2>
+                        <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                          Pick the season the calibration drape strips look best in. The locked
+                          direction drives every downstream report.
+                        </p>
+                      </div>
+                      <div className="flex flex-col gap-1.5">
+                        {portraitAnalysis.paletteHypotheses.map((h, idx) => {
+                          const isLocked = lockedPalette?.hypothesisId === h.id;
+                          const isModelTop = !lockedPalette && idx === 0;
+                          return (
+                            <label
+                              key={h.id}
+                              className={cx(
+                                "flex cursor-pointer items-center gap-2 rounded-md border bg-white px-2.5 py-1.5 text-sm transition",
+                                isLocked
+                                  ? "border-emerald-400 ring-1 ring-emerald-200"
+                                  : "border-[var(--border)] hover:border-zinc-400"
+                              )}
+                            >
+                              <input
+                                type="radio"
+                                name="lock-palette"
+                                className="h-3.5 w-3.5"
+                                checked={isLocked}
+                                onChange={() => handleLockHypothesis(h.id)}
+                                disabled={!portraitHash}
+                              />
+                              <span className="font-medium">{h.name}</span>
+                              <span className="text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                                {h.confidence}
+                              </span>
+                              {isLocked ? (
+                                <span className="ml-auto text-[10px] uppercase tracking-wide text-emerald-700">
+                                  Locked
+                                </span>
+                              ) : isModelTop ? (
+                                <span className="ml-auto text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                                  Model-suggested
+                                </span>
+                              ) : null}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+
                   <div className="space-y-4">
                     <div>
                       <h2 className="text-sm font-medium">Uploads</h2>
@@ -2018,17 +2191,265 @@ export default function Home() {
                           reference: "body",
                           title: "Full-body photo",
                           helpText:
-                            "Required for Body Shape Guide, Outfit Style Guide, and Generate All. Use a standing photo with the full silhouette visible. Face identity still comes from the portrait photo."
+                            "Required for Silhouette Balance Guide, Outfit Style Guide, and Generate All. Use a standing photo with the full silhouette visible. Face identity still comes from the portrait photo."
                         })
                       : null}
-                    {activePortraitStep.reference === "hand"
-                      ? renderUploadSlot({
-                          reference: "hand",
-                          title: "Hand photo",
-                          helpText:
-                            "Required for Nail Color Guide. Use a clear hand photo in natural light with fingers and skin tone visible."
-                        })
-                      : null}
+                  </div>
+
+                  <div className="space-y-2 rounded-md border border-[var(--border)] bg-[var(--panel-soft)] p-3">
+                    <button
+                      type="button"
+                      onClick={() => setShowPreferencesForm((v) => !v)}
+                      className="flex w-full items-center justify-between text-left text-sm font-medium"
+                      disabled={!portraitHash}
+                    >
+                      <span>Your preferences (optional)</span>
+                      <span className="text-xs text-[var(--muted-foreground)]">
+                        {showPreferencesForm ? "Hide" : "Show"}
+                      </span>
+                    </button>
+                    {!portraitHash ? (
+                      <p className="text-xs leading-5 text-[var(--muted-foreground)]">
+                        Upload a portrait first — preferences are saved per-portrait.
+                      </p>
+                    ) : null}
+                    {showPreferencesForm && portraitHash ? (
+                      <div className="space-y-3 pt-1">
+                        <div className="space-y-1">
+                          <label className="text-xs font-medium" htmlFor="hard-avoids">
+                            Hard avoids
+                          </label>
+                          <textarea
+                            id="hard-avoids"
+                            className="min-h-16 w-full resize-y rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm leading-5 outline-none transition focus:border-zinc-400 focus:ring-2 focus:ring-zinc-200"
+                            value={userProfile.hardAvoids.join(", ")}
+                            onChange={(event) =>
+                              updateUserProfile(
+                                "hardAvoids",
+                                event.target.value
+                                  .split(",")
+                                  .map((s) => s.trim())
+                                  .filter(Boolean)
+                              )
+                            }
+                            placeholder="e.g. bangs, mini skirts, gold-tone watches"
+                          />
+                          <p className="text-[11px] leading-4 text-[var(--muted-foreground)]">
+                            Comma-separated. Matched case-insensitively against names and families.
+                          </p>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-medium">Maintenance</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(["low", "medium", "high"] as MaintenanceTolerance[]).map((m) => {
+                              const checked = userProfile.maintenance === m;
+                              return (
+                                <label
+                                  key={m}
+                                  className={cx(
+                                    "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                    checked
+                                      ? "border-emerald-400 ring-1 ring-emerald-200"
+                                      : "border-[var(--border)] hover:border-zinc-400"
+                                  )}
+                                >
+                                  <input
+                                    type="radio"
+                                    name="maintenance"
+                                    className="h-3 w-3"
+                                    checked={checked}
+                                    onChange={() => updateUserProfile("maintenance", m)}
+                                  />
+                                  <span className="capitalize">{m}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-medium">Hair-change tolerance</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(
+                              ["keep-current", "small-change", "open-to-change"] as HairChangeTolerance[]
+                            ).map((h) => {
+                              const checked = userProfile.hairChangeTolerance === h;
+                              return (
+                                <label
+                                  key={h}
+                                  className={cx(
+                                    "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                    checked
+                                      ? "border-emerald-400 ring-1 ring-emerald-200"
+                                      : "border-[var(--border)] hover:border-zinc-400"
+                                  )}
+                                >
+                                  <input
+                                    type="radio"
+                                    name="hair-change-tolerance"
+                                    className="h-3 w-3"
+                                    checked={checked}
+                                    onChange={() => updateUserProfile("hairChangeTolerance", h)}
+                                  />
+                                  <span>{h.replace(/-/g, " ")}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-medium">Style preferences</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {STYLE_PREFERENCE_CHOICES.map((choice) => {
+                              const checked = userProfile.stylePreferences.includes(choice);
+                              return (
+                                <label
+                                  key={choice}
+                                  className={cx(
+                                    "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                    checked
+                                      ? "border-emerald-400 ring-1 ring-emerald-200"
+                                      : "border-[var(--border)] hover:border-zinc-400"
+                                  )}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="h-3 w-3"
+                                    checked={checked}
+                                    onChange={(event) => {
+                                      const next = event.target.checked
+                                        ? [...userProfile.stylePreferences, choice]
+                                        : userProfile.stylePreferences.filter((p) => p !== choice);
+                                      updateUserProfile("stylePreferences", next);
+                                    }}
+                                  />
+                                  <span className="capitalize">{choice}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[11px] leading-4 text-[var(--muted-foreground)]">
+                            Drives wardrobe capsule preset, frame and hairstyle scoring.
+                          </p>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-medium">Presentation override</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            <label
+                              className={cx(
+                                "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                !userProfile.presentation
+                                  ? "border-emerald-400 ring-1 ring-emerald-200"
+                                  : "border-[var(--border)] hover:border-zinc-400"
+                              )}
+                            >
+                              <input
+                                type="radio"
+                                name="presentation-override"
+                                className="h-3 w-3"
+                                checked={!userProfile.presentation}
+                                onChange={() => updateUserProfile("presentation", undefined)}
+                              />
+                              <span>Auto-detect</span>
+                            </label>
+                            {(["masculine", "feminine", "androgynous"] as StatedPresentation[]).map(
+                              (p) => {
+                                const checked = userProfile.presentation === p;
+                                return (
+                                  <label
+                                    key={p}
+                                    className={cx(
+                                      "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                      checked
+                                        ? "border-emerald-400 ring-1 ring-emerald-200"
+                                        : "border-[var(--border)] hover:border-zinc-400"
+                                    )}
+                                  >
+                                    <input
+                                      type="radio"
+                                      name="presentation-override"
+                                      className="h-3 w-3"
+                                      checked={checked}
+                                      onChange={() => updateUserProfile("presentation", p)}
+                                    />
+                                    <span className="capitalize">{p}</span>
+                                  </label>
+                                );
+                              }
+                            )}
+                          </div>
+                          <p className="text-[11px] leading-4 text-[var(--muted-foreground)]">
+                            Override the model&apos;s read of your visible presentation.
+                          </p>
+                        </div>
+
+                        <label className="flex cursor-pointer items-center gap-2 text-xs">
+                          <input
+                            type="checkbox"
+                            className="h-3.5 w-3.5"
+                            checked={userProfile.wearsMakeup ?? false}
+                            onChange={(event) =>
+                              updateUserProfile("wearsMakeup", event.target.checked)
+                            }
+                          />
+                          <span className="font-medium">I wear makeup regularly</span>
+                        </label>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-medium">Climate</span>
+                          <div className="flex flex-wrap gap-1.5">
+                            <label
+                              className={cx(
+                                "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                !userProfile.climate
+                                  ? "border-emerald-400 ring-1 ring-emerald-200"
+                                  : "border-[var(--border)] hover:border-zinc-400"
+                              )}
+                            >
+                              <input
+                                type="radio"
+                                name="climate"
+                                className="h-3 w-3"
+                                checked={!userProfile.climate}
+                                onChange={() => updateUserProfile("climate", undefined)}
+                              />
+                              <span>Unspecified</span>
+                            </label>
+                            {(["tropical", "temperate", "cold", "variable"] as Climate[]).map(
+                              (c) => {
+                                const checked = userProfile.climate === c;
+                                return (
+                                  <label
+                                    key={c}
+                                    className={cx(
+                                      "flex cursor-pointer items-center gap-1.5 rounded-md border bg-white px-2.5 py-1 text-xs transition",
+                                      checked
+                                        ? "border-emerald-400 ring-1 ring-emerald-200"
+                                        : "border-[var(--border)] hover:border-zinc-400"
+                                    )}
+                                  >
+                                    <input
+                                      type="radio"
+                                      name="climate"
+                                      className="h-3 w-3"
+                                      checked={checked}
+                                      onChange={() => updateUserProfile("climate", c)}
+                                    />
+                                    <span className="capitalize">{c}</span>
+                                  </label>
+                                );
+                              }
+                            )}
+                          </div>
+                          <p className="text-[11px] leading-4 text-[var(--muted-foreground)]">
+                            Wardrobe planner uses this to nudge fabric weight and layering.
+                          </p>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 </>
               ) : (

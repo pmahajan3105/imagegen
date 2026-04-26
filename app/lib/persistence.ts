@@ -1,8 +1,12 @@
+import type { LockedPalette } from "./paletteTypes";
+import type { UserProfileContext } from "./userContext";
+
 const PERSISTENCE_DB_NAME = "imagegen-history";
 const STATE_STORE = "state";
 const ANALYSES_STORE = "analyses";
+const PORTRAIT_METADATA_STORE = "portraitMetadata";
 const STATE_KEY = "latest";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export type HistoryEntry = {
   id: string;
@@ -35,6 +39,9 @@ function openPersistenceDb() {
       }
       if (!db.objectStoreNames.contains(ANALYSES_STORE)) {
         db.createObjectStore(ANALYSES_STORE);
+      }
+      if (!db.objectStoreNames.contains(PORTRAIT_METADATA_STORE)) {
+        db.createObjectStore(PORTRAIT_METADATA_STORE);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -118,4 +125,70 @@ export async function deleteCachedAnalysis(key: string) {
   });
 
   database.close();
+}
+
+export type PortraitMetadata = {
+  lockedPalette?: LockedPalette;
+  userProfile?: UserProfileContext;
+};
+
+export async function loadPortraitMetadata(
+  portraitHash: string
+): Promise<PortraitMetadata | undefined> {
+  const database = await openPersistenceDb();
+  const value = await new Promise<PortraitMetadata | undefined>((resolve, reject) => {
+    const transaction = database.transaction(PORTRAIT_METADATA_STORE, "readonly");
+    const request = transaction.objectStore(PORTRAIT_METADATA_STORE).get(portraitHash);
+    request.onsuccess = () => resolve(request.result as PortraitMetadata | undefined);
+    request.onerror = () => reject(request.error);
+  });
+
+  database.close();
+  return value;
+}
+
+export async function savePortraitMetadata(
+  portraitHash: string,
+  metadata: PortraitMetadata
+): Promise<void> {
+  const database = await openPersistenceDb();
+
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(PORTRAIT_METADATA_STORE, "readwrite");
+    transaction.objectStore(PORTRAIT_METADATA_STORE).put(metadata, portraitHash);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  database.close();
+}
+
+export async function saveLockedPalette(
+  portraitHash: string,
+  lockedPalette: LockedPalette
+): Promise<void> {
+  const existing = (await loadPortraitMetadata(portraitHash)) ?? {};
+  await savePortraitMetadata(portraitHash, { ...existing, lockedPalette });
+}
+
+export async function loadLockedPalette(
+  portraitHash: string
+): Promise<LockedPalette | undefined> {
+  const metadata = await loadPortraitMetadata(portraitHash);
+  return metadata?.lockedPalette;
+}
+
+export async function saveUserProfileContext(
+  portraitHash: string,
+  userProfile: UserProfileContext
+): Promise<void> {
+  const existing = (await loadPortraitMetadata(portraitHash)) ?? {};
+  await savePortraitMetadata(portraitHash, { ...existing, userProfile });
+}
+
+export async function loadUserProfileContext(
+  portraitHash: string
+): Promise<UserProfileContext | undefined> {
+  const metadata = await loadPortraitMetadata(portraitHash);
+  return metadata?.userProfile;
 }

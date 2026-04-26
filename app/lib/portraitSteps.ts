@@ -1,11 +1,47 @@
-import type { PortraitAnalysis, BodyAnalysis, Swatch } from "./analysis";
+import type { PortraitAnalysis, BodyAnalysis } from "./analysis";
+import {
+  BODY_AWARE_IDENTITY_PRESERVE_FRAGMENT,
+  IDENTITY_PRESERVE_FRAGMENT,
+  outfitPresentationGuidance,
+  presentationDirective,
+  renderLockedDecisions,
+  swatchList
+} from "./promptFragments";
+import { selectHairstyles } from "./hairstylePlanner";
+import { selectFrames } from "./eyewearPlanner";
+import { selectWardrobeCapsule } from "./wardrobePlanner";
+import { selectJewelryPlan } from "./jewelryPlanner";
+import { selectMakeupPlan } from "./makeupPlanner";
+import type { OccasionId, SessionContext, UserProfileContext } from "./userContext";
+import type { LockedPalette } from "./paletteTypes";
+import { EYEWEAR_RULES } from "../data/eyewearLibrary";
+import { OUTFIT_RULES } from "../data/outfitRules";
+import { getSeason } from "../data/colorSystem";
 
-export type ImageReference = "portrait" | "body" | "hand";
+export type ImageReference = "portrait" | "body";
 
 export type PortraitStepInput = {
   portrait: PortraitAnalysis;
   body?: BodyAnalysis;
+  userProfile?: UserProfileContext;
+  lockedPalette?: LockedPalette;
+  session?: SessionContext;
 };
+
+// Reorder paletteHypotheses so the user-locked hypothesis (if any) sits at index 0,
+// keeping every step's `paletteHypotheses[0]` access correct under both lock states.
+export function reorderForLock(
+  portrait: PortraitAnalysis,
+  lockedPalette: LockedPalette | null | undefined
+): PortraitAnalysis {
+  if (!lockedPalette) return portrait;
+  const idx = portrait.paletteHypotheses.findIndex((h) => h.id === lockedPalette.hypothesisId);
+  if (idx <= 0) return portrait;
+  const reordered = [...portrait.paletteHypotheses];
+  const [locked] = reordered.splice(idx, 1);
+  reordered.unshift(locked);
+  return { ...portrait, paletteHypotheses: reordered };
+}
 
 export type PortraitAnalysisStep = {
   title: string;
@@ -80,555 +116,1232 @@ function personLock(portrait: PortraitAnalysis) {
   const guardrailLines = portrait.styleGuardrails.length
     ? portrait.styleGuardrails.map((g) => `  - ${g}`).join("\n")
     : "  - (none specified)";
-  return `PERSON LOCK (the user's identity is defined by these pre-computed values, regardless of which user image is in slot 1; for hand or body reports the face is not visible in the input but the identity below still applies):
+  const iq = portrait.imageQuality;
+  // Threshold tuning: any single major signal (small face / poor lighting) hits 0.3,
+  // multiple co-occurring issues stack toward 0.5+. We surface a soft warning at
+  // ≥ 0.3 and a strong one at ≥ 0.5.
+  const qualityNotice =
+    iq.confidencePenalty >= 0.5
+      ? `PHOTO QUALITY WARNING: confidence penalty ${iq.confidencePenalty.toFixed(2)} (faceSize=${iq.faceSize}, lighting=${iq.lighting}, eyesVisible=${iq.eyesVisible}, angle=${iq.portraitAngle}). The source photo is suboptimal for identity-preserving rendering. Render conservatively: prefer fewer, simpler tiles; do not invent micro-features (mole placement, ear shape, exact hairline) the photo doesn't clearly show; if a region (eyes, brows, jaw) is occluded, replicate the most-confident neighboring frame rather than guessing. Add a small italic note "Photo quality limited — consider a closer, evenly-lit front-facing photo for stronger identity preservation." somewhere in the bottom band.`
+      : iq.confidencePenalty >= 0.3
+        ? `PHOTO QUALITY NOTE: confidence penalty ${iq.confidencePenalty.toFixed(2)} (faceSize=${iq.faceSize}, lighting=${iq.lighting}, angle=${iq.portraitAngle}). Render conservatively on identity-sensitive details; do not invent features the photo doesn't clearly show.`
+        : null;
+  return [
+    `PERSON LOCK (the user's identity is defined by these pre-computed values, regardless of which user image is in slot 1; for hand or body reports the face is not visible in the input but the identity below still applies):
 - Visible presentation: ${portrait.presentation.value}.
 - Facial hair: ${portrait.facialHair.value}. Render exactly this. Do not add facial hair if "None"; do not remove or change facial hair otherwise.
 - Current hair: ${portrait.currentHair.length} length, ${portrait.currentHair.texture} texture${portrait.currentHair.notes ? ` (${portrait.currentHair.notes})` : ""}. Hair color: ${portrait.hairColor}.
 - Eye color: ${portrait.eyeColor}. Skin tone, brow shape, jawline, age, and ethnic features come from the user's portrait analysis (the values are the source of truth even if the face is not visible in slot 1).
 - Style guardrails (must be honored in every rendered region):
 ${guardrailLines}
-- Do NOT feminize or masculinize the person to match the layout reference. The user appears ${portrait.presentation.value === "Masculine" ? "masculine-presenting; the output renders a masculine-presenting person" : portrait.presentation.value === "Feminine" ? "feminine-presenting; the output renders a feminine-presenting person" : "androgynous or has unclear presentation; render in a way that does not strongly gender the look"}.
-- Hairstyles, clothing cuts, makeup level, accessories, and silhouettes must suit the user's visible presentation, not the layout reference's subject.`;
-}
-
-function hairstyleGuidance(portrait: PortraitAnalysis) {
-  if (portrait.presentation.value === "Masculine") {
-    return `HAIRSTYLE SELECTION FOR THIS USER:
-- The user is masculine-presenting. Use masculine or gender-neutral grooming language.
-- Pick 4 from style families that fit the visible hair length/texture: textured crop, taper, side part, brushed-back waves, modern quiff, slick back, natural curls, shoulder-length flow, long layered flow.
-- If the user's current hair is Shoulder or Long, at least one option may preserve longer flow. If current hair is Short or Medium, do not invent below-shoulder length.
-- Do NOT use labels like "lob", "bob", "curtain bangs", "curtain fringe", "face-framing highlights", "pony tail", or "low bun" unless the uploaded portrait already clearly supports that exact styling direction.`;
-  }
-
-  if (portrait.presentation.value === "Feminine") {
-    return `HAIRSTYLE SELECTION FOR THIS USER:
-- The user is feminine-presenting. Choose styles that preserve the visible presentation and current hair direction.
-- Pick 4 from style families that fit the visible hair length/texture: soft layers, long layers, textured bob, collarbone cut, side-swept waves, sleek straight, polished updo, natural curls, face-framing layers.
-- Do not force short, long, fringe, or updo categories if they do not fit the uploaded portrait.`;
-  }
-
-  return `HAIRSTYLE SELECTION FOR THIS USER:
-- The user's presentation is ${portrait.presentation.value}. Use gender-neutral styling language.
-- Pick 4 styles that fit the visible hair length/texture without strongly gendering the look.
-- Favor terms like textured crop, soft layers, natural waves, brushed-back shape, side part, clean taper, collarbone cut, or shoulder-length flow when appropriate.
-- Do not force fringe, bob, bun, quiff, or heavily gendered labels unless the uploaded portrait clearly supports them.`;
-}
-
-function outfitPresentationGuidance(portrait: PortraitAnalysis) {
-  if (portrait.presentation.value === "Masculine") {
-    return `OUTFIT SELECTION FOR THIS USER:
-- Derive garment categories from the user's masculine-presenting styling cues and uploaded references.
-- Favor relevant categories such as knitwear, shirts, tees, polos, overshirts, trousers, denim, jackets, coats, boots, sneakers, loafers, belts, watches, and simple jewelry.
-- Do not default to blouses, skirts, dresses, heels, or feminine silhouettes unless the uploaded references clearly support that direction.`;
-  }
-
-  if (portrait.presentation.value === "Feminine") {
-    return `OUTFIT SELECTION FOR THIS USER:
-- Derive garment categories from the user's feminine-presenting styling cues and uploaded references.
-- Use feminine, neutral, or relaxed garment categories only when they match the uploaded references and body analysis.
-- Do not force dresses, skirts, heels, soft silhouettes, or glam styling by default; choose them only when they serve the user's visible style and silhouette rules.`;
-  }
-
-  return `OUTFIT SELECTION FOR THIS USER:
-- Derive garment categories from the user's visible styling cues and uploaded references.
-- Keep the wardrobe clean, practical, and not strongly gendered unless the uploaded references clearly suggest a direction.
-- Do not force dresses, suits, heels, skirts, or other gendered archetypes by default.`;
+- Do NOT feminize or masculinize the person to match the layout reference. The user appears ${presentationDirective(portrait.presentation.value)}.
+- Hairstyles, clothing cuts, makeup level, accessories, and silhouettes must suit the user's visible presentation, not the layout reference's subject.`,
+    qualityNotice
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function compose(parts: Array<string | null | undefined>) {
   return parts.filter(Boolean).join("\n\n");
 }
 
+// TABLE OF CONTENTS — visible reports in display order.
+// Search "STEP:" to jump to a step's definition; step order in this array
+// drives the visible UI order.
+//
+//   1. Palette Direction Report
+//   2. Face Balance Map
+//   3. Best Hairstyles Board
+//   4. Wardrobe Capsule Board
+//   5. Palette Calibration
+//   6. Makeup Shade Guide
+//   7. Accessory & Jewelry Metals Guide
+//   8. Eyeglasses / Frames Guide
+//   9. Silhouette Balance Guide
+//  10. Outfit Style Guide
+//
+// Retired-step tombstones (rationale only) live at the bottom of the array.
 export const PORTRAIT_ANALYSIS_STEPS: PortraitAnalysisStep[] = [
   {
+    // === STEP: Palette Direction Report ===
     title: "Palette Direction Report",
-    description: "Polished summary of the most likely palette direction, colors, and metals.",
+    description: "Locked palette direction with practical color rules, use-carefully exceptions, and 'also tested / why rejected' panel.",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
+    buildPrompt: ({ portrait, lockedPalette }) => {
+      const hypotheses = portrait.paletteHypotheses;
+      const locked = hypotheses[0];
+      const rejected = hypotheses.slice(1);
+
+      const lockChipLabel = lockedPalette?.source === "user" ? "LOCKED BY YOU" : "MODEL-SUGGESTED";
+      const lockSourceLine =
+        lockedPalette?.source === "user"
+          ? `user-locked (the user picked "${locked.name}" on the Palette Calibration page; lock the rest of the report to this direction)`
+          : `model-suggested (no user lock yet; render with the top model hypothesis and frame language as a recommendation, not a confirmed identity)`;
+
+      const bestNeutrals = locked.palette.bestNeutrals;
+      const bestWhite = bestNeutrals[0];
+      const bestDark = bestNeutrals[bestNeutrals.length - 1];
+      const canonicalRules = locked.rules ?? [];
+
+      // Pull rich research metadata that was ported but unused. Optional — falls
+      // back to existing structure when traitNotes / descriptiveNotes are absent.
+      const canonicalSeason = getSeason(locked.id);
+      const traitNotes = canonicalSeason?.traitNotes;
+      const descriptiveNotes = canonicalSeason?.descriptiveNotes ?? [];
+      const sisterSeasons = canonicalSeason?.sisterSeasons ?? [];
+      const seasonResearchBlock = traitNotes
+        ? `Research notes for ${locked.name} (use for the Direction Story panel; do not copy verbatim, distill to one short sentence per axis):
+- Undertone: ${traitNotes.undertone ?? "(unspecified)"}
+- Depth: ${traitNotes.depth ?? "(unspecified)"}
+- Chroma: ${traitNotes.chroma ?? "(unspecified)"}
+- Contrast: ${traitNotes.contrast ?? "(unspecified)"}${
+            descriptiveNotes.length
+              ? `\n- Descriptive notes: ${descriptiveNotes.slice(0, 2).join(" / ")}`
+              : ""
+          }${
+            sisterSeasons.length
+              ? `\n- Sister seasons (palettes that flatter adjacent to this one): ${sisterSeasons.join(", ")}`
+              : ""
+          }`
+        : null;
+
+      const groomingCardLabel =
+        portrait.presentation.value === "Masculine" ? "GROOMING TONICS" : "MAKEUP DIRECTION";
+      const groomingCardCopy =
+        portrait.presentation.value === "Masculine"
+          ? "tinted balms, beard care tones, sunscreen tints"
+          : "shade direction harmonizing with the locked palette";
+
+      const rulesBlock = canonicalRules.length
+        ? `Canonical rules for ${locked.name} (use these to compose the practical rule cards; do not invent new rules):\n- ${canonicalRules.join("\n- ")}`
+        : "(canonical rules unavailable for this hypothesis; compose practical rules from the palette swatches directly)";
+
+      const rejectedBlock = rejected.length
+        ? `Also tested (rejected hypotheses for the "Also Tested / Why Rejected" panel):
+
+${rejected
+  .map(
+    (h, i) =>
+      `${i + 1}. ${h.name} — confidence ${h.confidence}
+   Supporting signals (why the model considered it): ${h.supportingSignals.join(" / ") || "(none)"}
+   Risk notes (why it was rejected in favor of ${locked.name}): ${h.riskNotes.join(" / ") || "(none)"}`
+  )
+  .join("\n\n")}`
+        : "(no rejected hypotheses available)";
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "palette swatch groups",
+        decisions: [
+          { label: "Best Neutrals", details: `${bestNeutrals.length} canonical swatches` },
+          {
+            label: "Signature Colors",
+            details: `${locked.palette.signatureColors.length} canonical swatches`
+          },
+          {
+            label: "Accent Colors",
+            details: `${locked.palette.accentColors.length} canonical swatches`
+          },
+          {
+            label: "Use Carefully",
+            details: `${locked.palette.useCarefully.length} canonical swatches, conditional`
+          }
+        ],
+        doNotInventClause:
+          "Render exactly these 4 swatch groups in the order given. Use ONLY the listed canonical hex values; do not approximate, blend, or add new swatches."
+      });
 
       return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic Palette Direction Report infographic, using the user's portrait(s) for identity and the written layout instructions for structure. Frame the palette as the most likely direction from the analysis, not as a definitive diagnosis.",
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 Palette Direction Report — a personal color rule sheet for the locked palette direction. The page combines an identity hero band (the user's actual face) at the top with a swatch + rule infographic below. Identity is preserved on the hero portrait; the rest of the page is a structured infographic of swatches, practical rules, use-carefully callouts, a Direction Story panel, and 'also tested' rejected hypotheses.`,
         `Use these analysis values exactly. Do not re-derive them:
+- Locked direction: ${locked.name} (id: ${locked.id})
+- Lock source: ${lockSourceLine}
 - Depth: ${portrait.depth.value}
 - Contrast: ${portrait.contrast.value}
 - Undertone: ${portrait.undertone.displayLabel}
-- Most likely palette direction: ${portrait.colorSeason.value}
-- Palette feel: ${portrait.colorSeason.description}`,
-        `Available swatches. Use the exact hex values when rendering circles or color bands:
-- Signature colors: ${swatchList(portrait.palette.signatureColors)}
-- Accent colors: ${swatchList(portrait.palette.accentColors)}
-- Best neutrals: ${swatchList(portrait.palette.bestNeutrals)}
-- Avoid: ${swatchList(portrait.palette.avoid)}`,
+- Best metal direction: ${portrait.bestMetal.value}
+- Hair color (for the Hair Direction card): ${portrait.hairColor}
+- Visible presentation (gates the grooming/makeup card framing): ${portrait.presentation.value}`,
+        lockedFragment,
+        `Locked palette swatches (canonical hex values from colorSystem.ts; render these EXACTLY):
+- Best Neutrals (${bestNeutrals.length}): ${swatchList(bestNeutrals)}
+- Signature Colors (${locked.palette.signatureColors.length}): ${swatchList(locked.palette.signatureColors)}
+- Accent Colors (${locked.palette.accentColors.length}): ${swatchList(locked.palette.accentColors)}
+- Use Carefully (${locked.palette.useCarefully.length}): ${swatchList(locked.palette.useCarefully)}
+
+Best white candidate (lightest of best neutrals): ${bestWhite.name} ${bestWhite.hex}
+Best dark candidate (darkest of best neutrals): ${bestDark.name} ${bestDark.hex}`,
+        rulesBlock,
+        seasonResearchBlock,
+        rejectedBlock,
         `LAYOUT (build from these instructions, no layout reference image):
-- Region structure: a top "key features" band, a small supporting try-on grid of portrait tiles, a "palette direction" card with the most likely palette name and a circle palette, and a bottom band of swatch rows.
-- Header bar: render exactly the user's values: "${portrait.depth.value}" / "${portrait.contrast.value}" / "${portrait.undertone.displayLabel}".
-- Try-on tiles: render the SAME user (from Image 1) in each tile wearing only a solid top in a chosen color. Pick 4 flattering tile colors from the user's Signature/Accent swatches and 2 less-harmonious tile colors from the user's Avoid swatches. Vary the flattering picks across depth and saturation.
-- Beneath each tile, render a colored band matching the tile's hex, the swatch name in small caps, and a 2-3 word verdict caption that you compose for this specific user and swatch (positive for flattering, neutral-descriptive for less-harmonious, never insulting).
-- Where the reference has a "Best Palette" card, render: "PALETTE DIRECTION" eyebrow, the phrase "Most likely: ${portrait.colorSeason.value}" in large bold serif, a 1-2 line tagline derived from the palette feel, then a 12-circle palette in 3x4 (curated from the user's Signature + Accent swatches, no labels).
-- Where the reference has bottom swatch rows, render "BEST NEUTRALS" (5-7 circles from the user's Best Neutrals) and "USE CAREFULLY" (5-7 circles from the user's Avoid), each circle labeled with its swatch name in small caps below. Add a single concluding line composed for the user.`,
-        tileAnchor("solid top color"),
+- Hero band (~14% canvas height): a small head-and-shoulders portrait of the user (identity-preserved from Image 1, neutral expression, even lighting) sits at the LEFT, occupying about 1/3 of this band's width with a soft rounded mat. To the RIGHT of the portrait: small-caps eyebrow "PALETTE DIRECTION REPORT" on top, then large bold serif "Direction: ${locked.name}", then a small monospace small-caps chip "${lockChipLabel}". The hero band is the only place the user's face appears; the rest of the page is swatches and rule cards. Thin horizontal divider below.
+- Color identity row (~5%): three vertical columns separated by thin dividers — "DEPTH" / "CONTRAST" / "UNDERTONE" with this user's exact values beneath each label.
+- Palette display section (~22%): three labeled rows of color circles, generous spacing, soft drop-shadow on each circle.
+  - Row 1: small-caps label "BEST NEUTRALS", then the ${bestNeutrals.length} circles in canonical order (light to dark), each labeled below with its swatch name in tiny small-caps.
+  - Row 2: small-caps label "SIGNATURE COLORS", all signature swatch circles + names below.
+  - Row 3: small-caps label "ACCENT COLORS", all accent swatch circles + names below.
+- Direction Story panel (~9%): small-caps heading "DIRECTION STORY". Two short lines, distilled from the research notes above (one short sentence each on undertone/chroma and on depth/contrast). If sister seasons are listed in the research, add a tiny ITALIC line at the bottom of this panel: "Sister palettes: <comma-joined sister names>".
+- Practical rules grid (~22%): 3 columns × 2 rows = 6 rounded soft-shadow cards on slightly lighter cream. Order top-left to bottom-right:
+  - Top-left: "BEST WHITE" — circle in ${bestWhite.hex}, swatch name "${bestWhite.name}", one short rule line about how this user wears white-substitute.
+  - Top-middle: "BEST DARK" — circle in ${bestDark.hex}, swatch name "${bestDark.name}", one short rule line about how this user wears dark-substitute.
+  - Top-right: "DENIM" — short rule line composed from canonical rules; no specific swatch mandatory (denim is a wash direction, not one hex).
+  - Bottom-left: "METALS" — best metal "${portrait.bestMetal.value}" prominent, one short rule line about finishes/mixing drawn from canonical rules.
+  - Bottom-middle: "HAIR DIRECTION" — short rule line about hair-color tones that harmonize with this palette (current hair "${portrait.hairColor}" as the anchor).
+  - Bottom-right: "${groomingCardLabel}" — short rule line about ${groomingCardCopy}.
+- Use Carefully section (~10%): small-caps heading "USE CAREFULLY (CONDITIONAL)". Row of ${locked.palette.useCarefully.length} circles using exact useCarefully hex values, each labeled below with its swatch name in tiny small-caps. Above the row, one short note: "These work in narrow contexts (specific fabric, intensity, or season-of-year) — never forbidden, always conditional."
+- Also Tested / Why Rejected section (~12%): small-caps heading. ${rejected.length} card${rejected.length === 1 ? "" : "s"} (one per rejected hypothesis). Each card shows hypothesis name + confidence chip, then one supporting signal (why model considered), then one risk note (why ultimately rejected). Use neutral language ("did not draw light as evenly", not "wrong" or "bad").
+- Bottom band (~6%): single italic concluding line: "Use Carefully is conditional. Rejected hypotheses are alternatives the model considered, not wrong choices."`,
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Every rendered swatch (circles, bands, tile tops) must use one of the exact hex values listed in the swatches block.
-- Preserve facial identity, proportions, and skin texture from the uploaded portrait across every tile.
-- Hands have exactly five fingers. One person only across the entire image.
+- The user's face appears EXACTLY ONCE — in the hero band at the top. Do not render the face inside swatch circles, rule cards, the Direction Story, the Use Carefully section, the Why Rejected cards, or anywhere else. Do not render hands or body anywhere on the page.
+- Every rendered color (circle, dot, card swatch) uses an EXACT hex from the locked palette swatch list above. Do not approximate, mix, or introduce new colors.
+- No certainty language. Use "Direction: ${locked.name}", "Locked direction", "Model-suggested" — never "You are X" or "Your season is X".
+- The "Use Carefully" section MUST NOT use words like "Avoid", "Bad", "Wrong", or "Skip". Frame as conditional only.
+- The "Why Rejected" cards MUST NOT call rejected hypotheses wrong; describe them as alternatives that did not draw light as evenly or had risk notes.
+- The Direction Story panel uses ONLY the research notes provided; do not invent new color theory claims.
 - No watermarks, signatures, brand logos, or fake product codes.
-- Do not mention that this is AI-generated.
-- Inside the try-on grid, never use "Avoid", "Bad", or "Ugly" as a caption. Use "Skip" or descriptive phrasing.`,
+- Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Same person across all 6 try-on tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features, age.",
-          "Identical head-and-shoulders crop, same camera angle, same neutral expression in every tile.",
-          "Identical neutral background and identical soft warm lighting across tiles.",
-          "Every rendered color (tile top, swatch circle, color band) uses an exact hex from the swatches list above.",
-          'Right card headline includes exactly: "Most likely: ' + portrait.colorSeason.value + '"'
+          `Hero band shows the user's identity-preserved face exactly once at the top of the page.`,
+          `Locked direction headline reads exactly: "Direction: ${locked.name}"`,
+          `Practical rules grid renders exactly 6 cards in 3-col × 2-row order: BEST WHITE / BEST DARK / DENIM / METALS / HAIR DIRECTION / ${groomingCardLabel}.`,
+          `Best metal card prominently shows: ${portrait.bestMetal.value}.`,
+          `Use Carefully section uses the exact ${locked.palette.useCarefully.length} canonical swatches; conditional language only, never "avoid".`,
+          `Also Tested section shows ${rejected.length} rejected hypothesis card${rejected.length === 1 ? "" : "s"} in neutral language.`,
+          `Direction Story panel summarizes the research notes for ${locked.name} in two short sentences, not a copy.`
         ])
       ]);
     }
   },
   {
-    title: "Face Shape And Feature Map",
-    description: "Annotated face shape map with proportions and flattering principles.",
+    // === STEP: Face Balance Map ===
+    title: "Face Balance Map",
+    description: "Annotated portrait with canonical balancing principles for necklines, earrings, frames, and haircut direction. Identity-preserved hero photo + qualitative observations only (no fake measurements).",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) =>
-      compose([
-        imageRoles(null),
-        personLock(portrait),
-        "Generate a 1024x1536 face shape analysis infographic, using the user's portrait(s) for identity and the written layout instructions for structure.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Face shape: ${portrait.faceShape.value}
+    buildPrompt: ({ portrait }) => {
+      const canonical = portrait.canonicalFaceShape;
+
+      const observationsBlock = `Per-photo observations (for the on-photo callouts; render each as a small label with the observation text — no numeric values):
 - Forehead: ${portrait.faceShape.forehead}
 - Cheekbones: ${portrait.faceShape.cheekbones}
 - Jawline: ${portrait.faceShape.jawline}
-- Chin: ${portrait.faceShape.chin}
-- Length-to-width ratio: ${portrait.faceShape.lengthToWidthRatio}`,
+- Chin: ${portrait.faceShape.chin}`;
+
+      const stylingCardsBlock = canonical
+        ? `Render exactly these 4 styling principle cards in the principles grid. Use the canonical content provided; paraphrasing for legibility is fine, but do not invent new categories or merge cards.
+
+CARD 1 — NECKLINES
+- Best: ${canonical.necklines.best.join(", ")}
+- Use Carefully: ${canonical.necklines.useCarefully.join(", ")}
+
+CARD 2 — EARRINGS
+- Best: ${canonical.earrings.best.join(", ")}
+- Use Carefully: ${canonical.earrings.useCarefully.join(", ")}
+
+CARD 3 — FRAMES (eyeglass shapes)
+- Best: ${canonical.frames.best.join(", ")}
+- Use Carefully: ${canonical.frames.useCarefully.join(", ")}
+
+CARD 4 — HAIRCUT DIRECTION
+- Best: ${canonical.haircut.best.join(", ")}
+- Use Carefully: ${canonical.haircut.useCarefully.join(", ")}`
+        : `Canonical face-shape principles unavailable for "${portrait.faceShape.value}". Render only the per-photo observation callouts; omit the principles grid and replace with a "principles unavailable — calibrate face shape" notice.`;
+
+      const goalLine = canonical?.goal
+        ? `Canonical goal for ${canonical.name}: "${canonical.goal}"`
+        : "";
+
+      const notesLine = canonical?.notes?.length
+        ? `Canonical notes for ${canonical.name}: ${canonical.notes.join(" / ")}`
+        : "";
+
+      const lockedFragment = canonical
+        ? renderLockedDecisions({
+            itemNounPlural: "styling principle cards",
+            decisions: [
+              {
+                label: "Necklines",
+                details: `${canonical.necklines.best.length} flattering, ${canonical.necklines.useCarefully.length} conditional`
+              },
+              {
+                label: "Earrings",
+                details: `${canonical.earrings.best.length} flattering, ${canonical.earrings.useCarefully.length} conditional`
+              },
+              {
+                label: "Frames",
+                details: `${canonical.frames.best.length} flattering, ${canonical.frames.useCarefully.length} conditional`
+              },
+              {
+                label: "Haircut Direction",
+                details: `${canonical.haircut.best.length} flattering, ${canonical.haircut.useCarefully.length} conditional`
+              }
+            ],
+            doNotInventClause:
+              "Render exactly these 4 cards in the order given. Do not add a 5th card, merge cards, or invent new principles."
+          })
+        : "";
+
+      return compose([
+        imageRoles(null),
+        personLock(portrait),
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 Face Balance Map. Identity-required mode: the user's face is the hero of the page, with subtle qualitative callouts and a styling-principles panel. The face shape name is a tag — the principles do the visible work. This is a styling map, not a biometric diagnosis.`,
+        `Use these analysis values exactly. Do not re-derive them:
+- Face shape: ${portrait.faceShape.value}${portrait.faceShape.confidence === "low" ? " (low confidence; the shape may also read as a neighboring category)" : ""}
+- Hair color (preserve in render): ${portrait.hairColor}
+- Eye color (preserve in render): ${portrait.eyeColor}
+- Visible presentation: ${portrait.presentation.value}
+- Facial hair (preserve exactly): ${portrait.facialHair.value}`,
+        observationsBlock,
+        goalLine,
+        lockedFragment,
+        stylingCardsBlock,
+        notesLine,
         `LAYOUT (build from these instructions, no layout reference image):
-- Region structure: a top band with the face shape headline, a hero region with the user's portrait surrounded by 5 annotation callouts, a right card describing the face shape, and bottom cards for contour/highlight map and face-shape principles.
-- Top band: render "YOUR FACE SHAPE" small-caps eyebrow + "${portrait.faceShape.value}" in extra-large bold serif.
-- Hero region: a photorealistic head-and-shoulders portrait of the user from Image 1. Five thin tan leader lines fan out from the face to small text callouts:
-  1. "FOREHEAD WIDTH" - body: "${portrait.faceShape.forehead}"
-  2. "CHEEKBONE PROMINENCE" - body: "${portrait.faceShape.cheekbones}"
-  3. "JAWLINE ANGLE" - body: "${portrait.faceShape.jawline}"
-  4. "FACE LENGTH TO WIDTH RATIO" - body: "Yours: ${portrait.faceShape.lengthToWidthRatio}"
-  5. "CHIN SHAPE" - body: "${portrait.faceShape.chin}"
-  Leader lines must not cross the eyes, nose, or mouth.
-- Right card: face-silhouette icon for ${portrait.faceShape.value}, heading "${portrait.faceShape.value} FACE" small-caps, then 2-3 lines describing this face shape's qualities. Compose the description fresh.
-- Bottom-left card "CONTOUR & HIGHLIGHT MAP": line-art face diagram with shaded zones for ${portrait.faceShape.value}, plus 3 rows (BRONZER / HIGHLIGHTER / BLUSH) each with a small swatch circle + label + 1-line placement note specific to ${portrait.faceShape.value}.
-- Bottom-right card "BEST FOR ${portrait.faceShape.value.toUpperCase()} FACES": 2x2 grid - 2 lean-in principles (green check) and 2 use-carefully principles (grey dot), each under 12 words. Compose all 4 principles dynamically.`,
+- Top band (~7% canvas height): small-caps eyebrow "FACE BALANCE MAP", thin horizontal divider below, small monospace small-caps chip "${portrait.faceShape.value.toUpperCase()}" right-aligned next to the eyebrow.
+${canonical?.goal ? `- Goal line (~5%): centered single line in italic serif, exact text: "${canonical.goal}"` : ""}
+- Hero region (~46% canvas height): a head-and-shoulders photorealistic portrait of the SAME person from Image 1, neutral cream background, soft warm studio lighting, neutral expression. Subtle thin warm-gray callout lines (1px, low opacity, ~30% black) emerge from each of the 4 facial regions to small text labels in the hero margins:
+  - FOREHEAD label (top-left margin): tiny small-caps "FOREHEAD" + the per-photo observation in regular type below.
+  - CHEEKBONES label (top-right margin): tiny small-caps "CHEEKBONES" + observation.
+  - JAWLINE label (bottom-right margin): tiny small-caps "JAWLINE" + observation.
+  - CHIN label (bottom-center, just under the figure): tiny small-caps "CHIN" + observation.
+  - Callout lines do not cross the eyes, nose, or mouth and do not obscure the face. NO numeric measurements anywhere on the page.
+- Principles grid (~30% canvas height): 4 rounded soft-shadow cards in a 2-column × 2-row grid on slightly lighter cream:
+  - Top-left: NECKLINES
+  - Top-right: EARRINGS
+  - Bottom-left: FRAMES
+  - Bottom-right: HAIRCUT DIRECTION
+  - Each card has a small-caps heading, then two stacked sub-blocks: "BEST" (with comma-separated list) and "USE CAREFULLY" (with comma-separated list). Use the canonical content from the styling-cards block above.
+${canonical?.notes?.length ? `- Notes band (~6%): one short italic line summarizing canonical notes (do not invent new content; paraphrase the canonical notes if needed for length).` : ""}
+- Bottom band (~6%): single concluding line in italic: "Face balance is a starting point — fit, scale, and personal style refine it."`,
+        tileAnchor("annotated portrait (single hero photo with subtle text callouts; only one face is rendered on the page)"),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Preserve facial identity, proportions, and skin texture from the uploaded portrait. The hero portrait is the same person, undistorted.
-- Hands have exactly five fingers. One person only across the entire image.
-- No watermarks, signatures, brand logos, or fake product codes.
-- Do not invent precise ratio ranges. Only display "Yours: ${portrait.faceShape.lengthToWidthRatio}".
+- Identity-required mode: render exactly ONE photo of the user (the hero portrait). Do NOT render additional faces, try-on tiles, or comparison portraits.
+- NO numeric measurements anywhere. No length-to-width ratios, no pixel widths, no centimeters, no millimeters, no degrees. The face shape is qualitative, not measured.
+- Callout lines are subtle (1px, low-opacity warm gray). They label features without obscuring or distorting the face.
+- The 4 styling principle cards must use the canonical content above; do not invent or merge categories.
+- "Use Carefully" sub-blocks must NOT use words like "Avoid", "Bad", "Wrong", or "Skip"; frame as conditional.
+- Preserve identity exactly: face structure, skin tone, eye color, hair color, hair length, facial hair, age. Apply the identity-preserve fragment above.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          `Hero portrait must read as the same person from the uploaded reference. Same eyes, brows, nose, mouth, skin tone, hair, ethnic features.`,
-          `Face shape printed in the top band is exactly: ${portrait.faceShape.value}.`,
-          `Length-to-width ratio printed in the right callout is exactly: ${portrait.faceShape.lengthToWidthRatio}.`,
-          "Five callouts: forehead, cheekbones, jawline, chin, length ratio. Leader lines never cross the face's eyes, nose, or mouth."
+          "Exactly ONE hero portrait of the user; no additional faces, no try-on tiles, no comparison portraits.",
+          `Face shape chip is exactly: ${portrait.faceShape.value.toUpperCase()}.`,
+          "No numeric measurements, ratios, pixel widths, or centimeters anywhere on the page.",
+          "The 4 principle cards (Necklines / Earrings / Frames / Haircut Direction) match the canonical content; no extras, no omissions, no merged categories.",
+          "Callout lines do not cross the eyes, nose, or mouth and do not distort the face. Identity preserved exactly."
         ])
-      ])
+      ]);
+    }
   },
   {
+    // === STEP: Best Hairstyles Board ===
     title: "Best Hairstyles Board",
-    description: "Four photo-realistic hairstyle options tailored to the face shape.",
+    description: "Four hairstyles selected from a 100-entry library, filtered for face shape, presentation, hair texture, and facial hair.",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) =>
-      compose([
+    buildPrompt: ({ portrait, userProfile }) => {
+      const { selected, candidateCount, policyUsed } = selectHairstyles(portrait, userProfile);
+      const N = selected.length;
+
+      const decisions = selected.map((entry) => ({
+        label: entry.name,
+        details: entry.description
+      }));
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "hairstyles",
+        decisions,
+        doNotInventClause:
+          "Render exactly these hairstyles, in the order given. Do not invent, substitute, merge, or add other hairstyle variants."
+      });
+
+      const styleDetails = selected
+        .map((entry, i) => {
+          const lines = [
+            `Hairstyle ${i + 1}: ${entry.name}`,
+            `- Description: ${entry.description}`,
+            `- Maintenance: ${entry.maintenance}`,
+            `- Tone: ${entry.tone}`,
+            `- Compatible face shapes: ${entry.faceShapes.join(", ")}`,
+            `- Compatible textures: ${entry.hairTextures.join(", ")}`
+          ];
+          if (entry.notes) lines.push(`- Stylist notes: ${entry.notes}`);
+          if (entry.disallowedIf) lines.push(`- Disallowed if: ${entry.disallowedIf}`);
+          return lines.join("\n");
+        })
+        .join("\n\n");
+
+      const planNote = `Planner: ${candidateCount} candidates passed the deterministic filter (face shape ${portrait.faceShape.value} ∩ presentation ${portrait.presentation.value} ∩ texture ${portrait.currentHair.texture} ∩ facial hair ${portrait.facialHair.value}${policyUsed.useLengthTolerance ? " ∩ length tolerance" : ""}${policyUsed.useMaintenance ? " ∩ maintenance" : ""}). Top ${N} selected by score.`;
+
+      return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic hairstyle recommendation board. Identity preservation is the single most important rule on this page; the four faces must read as the same person to a casual viewer.",
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 photorealistic Best Hairstyles Board. The board shows the user with ${N} different hairstyles from a curated library, all pre-filtered as flattering for this user's face shape, presentation, hair texture, and facial-hair level.`,
+        lockedFragment,
+        `Per-hairstyle details (canonical data, do not modify):\n\n${styleDetails}`,
         `Use these analysis values exactly. Do not re-derive them:
 - Face shape: ${portrait.faceShape.value}
-- Hair color (preserve in every tile): ${portrait.hairColor}`,
+- Presentation: ${portrait.presentation.value}
+- Current hair: ${portrait.currentHair.length} length, ${portrait.currentHair.texture} texture
+- Hair color (preserve exactly in every tile): ${portrait.hairColor}
+- Facial hair (preserve exactly): ${portrait.facialHair.value}`,
+        planNote,
         `LAYOUT (build from these instructions, no layout reference image):
-- Use 4 photorealistic head-and-shoulders portrait tiles in a clean 2-column by 2-row grid. Larger per-tile pixel budget is intentional.
-- Top band: small-caps title "BEST HAIRSTYLES FOR ${portrait.faceShape.value.toUpperCase()} FACE" with a thin divider below.
-- Each tile shows the SAME person from the user portrait(s) wearing a plain neutral white or cream top against a soft warm beige seamless background, soft warm studio lighting, relaxed neutral expression with slight closed-mouth smile. ONLY the hairstyle changes between tiles.
-- Below each tile: hairstyle name in bold small-caps (2-5 words) and a 1-line caption (under 14 words) explaining why this style flatters a ${portrait.faceShape.value} face. Compose each caption fresh.
-- Pick 4 distinct hairstyles that flatter ${portrait.faceShape.value} AND suit the user's visible presentation (see Person Lock above). The four picks should span different length/shape/formality families that are plausible for the uploaded portrait.
-- ${hairstyleGuidance(portrait)}
-- Do not repeat a style across tiles.
-- Style names and captions must use neutral language and must not contradict ${portrait.presentation.value} presentation.`,
-        `IDENTITY ANCHOR (hard requirement across all 4 tiles):
-- Same person in every tile, no exceptions. Faces in all 4 tiles must look like the same individual to a casual viewer at a glance.
-- Preserve exactly: gender presentation, eye shape and color, brow shape and thickness, nose shape and width, mouth and lip shape, chin shape, skin tone, freckles or moles, ethnic features, apparent age.
-- Preserve facial hair exactly as shown in Image 1: render the same beard, mustache, or stubble in every tile. If Image 1 has no facial hair, do not add any. If Image 1 has a beard, every tile shows the same beard.
-- Preserve exactly the hair color: ${portrait.hairColor}. The cut and styling change; the color does not lighten, darken, warm, or cool.
-- Same head-and-shoulders framing, same camera angle (straight-on or very slight three-quarter), same neutral relaxed expression with closed-mouth or slight smile.
-- Same neutral white or cream top across all four tiles.
-- Same soft warm beige seamless background across all four tiles.
-- Same soft, warm, even studio lighting across all four tiles.
-- The only variable across the four tiles is the hairstyle.`,
+- Top band (~10% canvas height): small-caps title "BEST HAIRSTYLES FOR ${portrait.faceShape.value.toUpperCase()} FACE", thin horizontal divider below.
+- Main region: ${N} photorealistic head-and-shoulders portrait tiles in a ${N === 4 ? "2-column by 2-row" : N === 3 ? "single row of 3" : N === 2 ? "single row of 2" : "single column"} grid. Each tile shows the SAME person from Image 1, neutral white or cream top, soft warm beige seamless background, soft warm studio lighting, neutral expression with slight closed-mouth smile. ONLY the hairstyle changes between tiles.
+- Tile order matches the per-hairstyle details list above (top-left to bottom-right).
+- Below each tile, on a thin label band:
+  - Hairstyle name in bold small-caps, matching the canonical name exactly.
+  - A small chip in the corner: maintenance level ("LOW MAINT" / "MED MAINT" / "HIGH MAINT") in tiny mono caps.
+  - One short rationale line (under 14 words) explaining why this style flatters the user's face + presentation + current hair. Compose fresh per tile, grounded in the canonical description.`,
+        tileAnchor("hairstyle (face is identical across tiles; only the hairstyle changes)"),
         STYLE_BLOCK,
         `Hard rules:
 - "photorealistic" rendering. No illustration, painting, or stylized look.
 - All text must be legible English. No gibberish, no warped letters.
+- The ${N} hairstyles must match the listed canonical names exactly; do not invent variations or merge styles.
 - No watermarks, signatures, brand logos, or fake product codes.
 - No sunglasses, hats, scarves, or face-obscuring accessories on any tile.
 - Do not change the person's facial structure, ethnicity, age, skin tone, or hair color.
-- Do not over-retouch skin. Pores, freckles, and natural skin texture should remain.
-- Hairstyle names: bold small-caps, 2 to 5 words.
+- Preserve facial hair exactly as analyzed (${portrait.facialHair.value}). Every tile shows that exact facial-hair level.
+- Hairstyle names: bold small-caps, matching the canonical name from the per-hairstyle details list.
 - Captions: under 14 words, neutral supportive language.
-- Do not mention that this is AI-generated.`
-      ])
+- Do not mention that this is AI-generated.`,
+        preserveRepeat([
+          `Same person across all ${N} tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features, age.`,
+          "Identical head-and-shoulders crop, same camera angle, same neutral expression in every tile.",
+          "Identical neutral background and identical soft lighting across tiles — only the hairstyle changes.",
+          `Hair color preserved exactly: ${portrait.hairColor}.`,
+          `Facial hair preserved exactly: ${portrait.facialHair.value}.`,
+          `Tile count: exactly ${N} hairstyles, matching the canonical names listed above.`
+        ])
+      ]);
+    }
   },
   {
+    // === STEP: Wardrobe Capsule Board ===
     title: "Wardrobe Capsule Board",
-    description: "Capsule wardrobe built around the inferred flattering palette.",
+    description: "18-slot capsule from a 6-preset library, palette-resolved cutouts, no person — pre-filtered by user style preference and locked palette.",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
+    buildPrompt: ({ portrait, userProfile }) => {
+      const plan = selectWardrobeCapsule(portrait, userProfile);
+      const { capsule, resolved, paletteName, presetUsed } = plan;
+
+      const slotsByCat = {
+        tops: resolved.filter((r) => r.category === "top"),
+        bottoms: resolved.filter((r) => r.category === "bottom"),
+        layers: resolved.filter((r) => r.category === "layer"),
+        shoes: resolved.filter((r) => r.category === "shoes"),
+        accessories: resolved.filter((r) => r.category === "accessory")
+      };
+
+      const slotDetails = resolved
+        .map(
+          (r, i) =>
+            `Slot ${i + 1} — ${r.slot.slotId} (${r.category}): ${r.slot.type}
+- Color: ${r.resolvedSwatch.name} ${r.resolvedSwatch.hex} (palette role: ${r.slot.paletteRole})
+- Silhouette role: ${r.slot.silhouette}
+- Intent: ${r.slot.intent}
+- Formality: ${r.slot.formality}
+- Runtime note: ${r.slot.runtimeNote}`
+        )
+        .join("\n\n");
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "wardrobe slots",
+        decisions: resolved.map((r) => ({
+          label: `${r.slot.slotId} · ${r.slot.type}`,
+          details: `${r.resolvedSwatch.name} ${r.resolvedSwatch.hex}`
+        })),
+        doNotInventClause:
+          "Render exactly these 18 slots in the order given, in the listed colors. Do not invent new garment types, swap categories, or change the resolved palette swatches."
+      });
+
+      const formulasBlock =
+        capsule.outfitFormulas.length > 0
+          ? `Outfit formulas (canonical, reference slot IDs above):\n- ${capsule.outfitFormulas.join("\n- ")}`
+          : "";
+
+      const substitutionBlock =
+        capsule.substitutionRules.length > 0
+          ? `Substitution rules (canonical):\n- ${capsule.substitutionRules.join("\n- ")}`
+          : "";
+
+      const outfitMathLine =
+        capsule.outfitMath.length > 0 ? `Outfit math: ${capsule.outfitMath.join(" / ")}` : "";
+
+      const climate = userProfile?.climate;
+      const climateGuidanceMap: Record<string, string> = {
+        tropical:
+          "tropical climate — favor lightweight breathable fabrics (linen, light cotton, lightweight wool blends), shorter sleeves, and minimal layering; render heavy coats and chunky knits as lightweight equivalents (a linen overshirt instead of a wool overcoat) without changing slot IDs",
+        temperate:
+          "temperate climate — render canonical pieces as listed without seasonal substitution",
+        cold:
+          "cold climate — favor heavier fabrics (wool, brushed cotton, heavy denim), full-coverage hemlines and sleeves, and emphasize the layering pieces; render lightweight pieces as heavier-weight equivalents within the same garment type",
+        variable:
+          "variable climate — emphasize layerability; the LAYER slots are doing real work, not optional"
+      };
+      const climateLine = climate ? `\nClimate context: ${climateGuidanceMap[climate]}.` : "";
+      const planNote = `Planner: capsule preset "${presetUsed}" selected from user style preferences (${(userProfile?.stylePreferences ?? []).join(", ") || "default"}). Locked palette "${paletteName}" used for swatch resolution; round-robin within each palette role to vary swatches across same-role slots.${climateLine}`;
 
       return compose([
-        imageRoles("Wardrobe Capsule Board"),
+        imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 wardrobe capsule infographic styled as an editorial fashion lookbook, using the LAYOUT REFERENCE for structure.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Season: ${portrait.colorSeason.value}
-- Season feel: ${portrait.colorSeason.description}
-- Best metal (use for buckles, hardware, jewelry): ${portrait.bestMetal.value}`,
-        `Approved garment swatches. Every garment cutout's color must match one of these exact hex values:
-- Best neutrals (use for tops, bottoms, outerwear, shoes): ${swatchList(portrait.palette.bestNeutrals)}
-- Signature colors (use for tops and outerwear primarily): ${swatchList(portrait.palette.signatureColors)}
-- Accent colors (use sparingly, for one or two pop pieces): ${swatchList(portrait.palette.accentColors)}
-- Avoid (do NOT use any of these): ${swatchList(portrait.palette.avoid)}`,
-        `LAYOUT (follow the LAYOUT REFERENCE):
-- Reproduce the region structure shown in the layout reference: a top band with portrait inset + season title, a 4-column garment grid (TOPS / BOTTOMS / OUTERWEAR / SHOES), an outfit-combinations strip, and a color-rules card.
-- Top band: small rounded-corner portrait inset of the user (Image 1), then "YOUR SEASON:" eyebrow + "${portrait.colorSeason.value}" in large bold serif + a 1-2 line tagline drawn from the season feel.
-- Grid: 4 columns × 3 garment cutouts per column = 12 cutouts. Headers "TOPS" / "BOTTOMS" / "OUTERWEAR" / "SHOES" in small-caps. Each cutout is a clean photo-realistic product shot (no model, no background, soft drop shadow). Below each cutout: garment type (sans-serif) and the matching swatch name (small-caps).
-- Every cutout color must match an exact hex from the approved swatches above. Color name label must match the swatch's name. Across the 12 cutouts, prefer Best Neutrals and Signature Colors; at most 2 garments may use an Accent Color; never use an Avoid color. Vary garment types within each column.
-- Choose the specific 12 garments yourself, grounded in the season "${portrait.colorSeason.value}", the best metal "${portrait.bestMetal.value}", and the user's ${portrait.presentation.value} visible presentation. Do NOT copy gendered garment categories from the layout reference. For masculine-presenting users, favor knits, shirts, tees, trousers, denim, jackets, coats, boots, sneakers, loafers, and belts. For feminine-presenting users, choose feminine or neutral garment categories only when they fit the uploaded portrait's styling cues. For androgynous or unclear presentation, keep the capsule clean, neutral, and not strongly gendered.
-- Bottom-left "OUTFIT COMBINATIONS": 2 small flat-lay outfit collages numbered 1 and 2, each combining 3-4 of the 12 garments with hardware in ${portrait.bestMetal.value}.
-- Bottom-right "YOUR COLOR RULES" card: 3 numbered rules, each with a small color circle + 2-4 word title + 1-line body. Compose all 3 rules dynamically for "${portrait.colorSeason.value}".`,
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 Wardrobe Capsule Board. Hybrid mode: a small identity hero band at the top with the user's actual face, then a product-cutout infographic below. The user's face appears EXACTLY ONCE in the hero band; the 18 garment cutouts in the main grid are pure product cutouts (no model, no body, no mannequin, no hands or feet inside the cutouts).`,
+        lockedFragment,
+        `Per-slot details (canonical data, do not modify):
+
+${slotDetails}`,
+        `Capsule preset: ${capsule.name}
+- Style preset ID: ${capsule.stylePreset}
+- Lifestyle: ${capsule.lifestyle}
+- Default formality: ${capsule.defaultFormality}
+- Philosophy: ${capsule.philosophy}
+- Capsule logic: ${capsule.capsuleLogic}
+- Palette recipe: ${capsule.paletteRecipe}`,
+        `Locked palette in use: ${paletteName} (${plan.paletteId})
+- Visible presentation: ${portrait.presentation.value}
+- Best metal direction (use for hardware on bags, belts, jewelry): ${portrait.bestMetal.value}`,
+        formulasBlock,
+        substitutionBlock,
+        outfitMathLine,
+        planNote,
+        `LAYOUT (build from these instructions, no layout reference image):
+- Hero band (~13% canvas height): a small head-and-shoulders portrait of the user (identity-preserved from Image 1, neutral expression, even lighting) sits at the LEFT with a soft rounded mat. To the RIGHT of the portrait: small-caps eyebrow "WARDROBE CAPSULE" on top, then the capsule chip "${capsule.name.toUpperCase()}" in monospace small-caps, then the philosophy line "${capsule.philosophy}" in italic serif at small size. Thin horizontal divider below the band.
+- Locked-palette badge (~4%): small-caps "${paletteName.toUpperCase()}" + tiny text "locked palette" + a row of 4 hex dots (one per category that uses palette colors).
+- Main grid (~55% canvas height): 5-column layout, one column per category in this order: TOPS (${slotsByCat.tops.length}), BOTTOMS (${slotsByCat.bottoms.length}), LAYERS (${slotsByCat.layers.length}), SHOES (${slotsByCat.shoes.length}), ACCESSORIES (${slotsByCat.accessories.length}).
+  - Each column has a small-caps category header at the top.
+  - Each column shows photorealistic product cutouts of the listed garments stacked vertically. Soft drop shadow under each cutout. Neutral cream background. The cutouts are products only — no model, no body, no mannequin, no hands or feet inside them.
+  - Each cutout is rendered EXACTLY in the resolved hex listed in the per-slot details. Garment type is rendered in the slot's listed type description.
+  - Below each cutout, a tiny three-line label: slot ID in small mono caps; garment type (1-3 words); resolved swatch name with the hex code in tiny mono.
+  - Hardware on bags, belts, and any visible metal is rendered in ${portrait.bestMetal.value}.
+- Outfit formulas card (~13% canvas height): rounded soft-shadow card with heading "OUTFIT FORMULAS" small-caps. List the canonical outfit formulas above; each formula references slot IDs (e.g. "${capsule.outfitFormulas[0] ?? ""}"). Render slot IDs in small mono caps.
+- Outfit math footer (~5%): single italic line in tiny type with the canonical outfit-math text.
+- Bottom band (~3%): single italic concluding line: "Render runtime — actual brand picks come at fitting time."`,
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Every garment color must use one of the exact hex values listed in the swatches block. Color name labels must match the swatch name.
-- Never render a garment in a color from the Avoid list.
-- No brand names. No prices. No fake product codes or SKUs.
-- Hardware (buckles, zippers, jewelry, hardware on bags) is rendered in the ${portrait.bestMetal.value} metal tone.
-- Garment cutouts are clean product shots; no models wearing them inside the columns.
-- The portrait inset preserves facial identity, proportions, and skin texture from the uploaded portrait.
-- Garment categories must match the user's visible presentation and style guardrails; do not default to blouses, skirts, heels, dresses, or feminine styling unless the portrait supports that direction.
+- HYBRID MODE: the user's face appears EXACTLY ONCE — in the hero band at the top. The 18 product cutouts in the main grid contain no person, no model, no body part, no hand, no foot, no mannequin. Do not place a face inside any garment cutout or category column.
+- Each cutout color uses the EXACT hex listed in the per-slot details. Do not approximate, mix, or substitute.
+- Slot IDs labeled below each cutout match the per-slot details list.
+- Garment types match the canonical descriptions; do not invent variants.
+- Hardware metal tone across the page is exactly: ${portrait.bestMetal.value}.
+- No brand names, no prices, no fake product codes or SKUs.
+- Outfit formula card references slot IDs from the canonical list (e.g. "WP-T01 + WP-B01 + ..."), not generic descriptions.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          `Season name printed in the top band is exactly: ${portrait.colorSeason.value}.`,
-          `Hardware metal tone across the entire board is exactly: ${portrait.bestMetal.value}.`,
-          "Every garment color matches one of the approved hex values. No avoid colors anywhere on the board.",
-          "Portrait inset reads as the same person from the uploaded reference. Same eyes, brows, nose, mouth, skin tone, ethnic features.",
-          "Outfit-combo collages reuse garments visibly drawn from the 12 cutouts above."
+          "Hero band shows the user's identity-preserved face exactly once at the top of the page.",
+          "Main grid is product cutouts only — no person, no model, no body, no mannequin inside any cutout.",
+          `Capsule chip in the top band reads exactly: ${capsule.name.toUpperCase()}.`,
+          `Locked palette badge reads exactly: ${paletteName.toUpperCase()}.`,
+          "Render exactly 18 product cutouts: 4 tops + 3 bottoms + 3 layers + 3 shoes + 5 accessories.",
+          "Each cutout color matches the exact hex from the per-slot details; no improvisation.",
+          `Hardware tone across the entire page is exactly: ${portrait.bestMetal.value}.`,
+          "Slot IDs labeled below each cutout match the per-slot details list verbatim."
         ])
       ]);
     }
   },
   {
+    // === STEP: Palette Calibration ===
     title: "Palette Calibration",
-    description: "Evidence board comparing colors near the face before trusting a palette direction.",
+    description: "Drape-strip comparison of the top palette hypotheses for this person, before locking a season.",
     reference: "portrait",
     requires: { portrait: true },
     buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
+      const hypotheses = portrait.paletteHypotheses;
+      const N = hypotheses.length;
+
+      const hypothesisDetails = hypotheses
+        .map((h, i) => {
+          // Research-backed positioning fields (optional). Surfaced in the per-panel
+          // "Why" line so the user understands the season's logic, not just the swatches.
+          const canonicalH = getSeason(h.id);
+          const positioningLines: string[] = [];
+          if (canonicalH?.munsellPositioning) {
+            positioningLines.push(`- Munsell positioning: ${canonicalH.munsellPositioning}`);
+          }
+          if (canonicalH?.skinTextureMetaphor) {
+            positioningLines.push(`- Skin-texture metaphor: ${canonicalH.skinTextureMetaphor}`);
+          }
+          if (canonicalH?.confidenceNote) {
+            positioningLines.push(`- Confidence caveat (canonical): ${canonicalH.confidenceNote}`);
+          }
+          return `Hypothesis ${i + 1}: ${h.name} (confidence: ${h.confidence})
+- Drape colors for this panel (use exactly these hex values, no substitutions):
+  - Best Neutrals: ${swatchList(h.palette.bestNeutrals)}
+  - Signature Colors: ${swatchList(h.palette.signatureColors)}
+  - Accent Colors: ${swatchList(h.palette.accentColors)}
+- Supporting signals: ${h.supportingSignals.join("; ") || "(none)"}
+- Risk notes: ${h.riskNotes.join("; ") || "(none)"}${
+            positioningLines.length ? "\n" + positioningLines.join("\n") : ""
+          }`;
+        })
+        .join("\n\n");
+
+      const lockedDecisions = renderLockedDecisions({
+        itemNounPlural: "palette hypotheses",
+        decisions: hypotheses.map((h) => ({
+          label: `${h.name} (${h.confidence} confidence)`,
+          details: h.supportingSignals.slice(0, 2).join("; ") || undefined
+        })),
+        doNotInventClause:
+          "Do not invent additional palette hypotheses, substitute season names, or alter the listed hex values. Render exactly these hypotheses, in the order given."
+      });
+
+      const panelHeightPct = Math.floor(80 / N);
 
       return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic Palette Calibration board, using the user's portrait(s) for identity and the written layout instructions for structure. This is the evidence/testing report before trusting a palette direction. The page is focused on color comparison; do not include a separate palette card or full neutrals/avoid rows (those belong to the Palette Direction Report).",
-        `Use these analysis values exactly. Do not re-derive them:
-- Depth: ${portrait.depth.value}
-- Contrast: ${portrait.contrast.value}
-- Undertone: ${portrait.undertone.displayLabel}`,
-        `Approved tile swatches. Every tile color must match one of these exact hex values:
-- Signature colors (use 3 for Best tiles): ${swatchList(portrait.palette.signatureColors)}
-- Accent colors (use 2 for Good tiles): ${swatchList(portrait.palette.accentColors)}
-- Avoid (use 3 for Skip tiles): ${swatchList(portrait.palette.avoid)}`,
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 photorealistic Palette Calibration board. The board compares the top ${N} palette hypotheses for this person as "drape strips" — each strip shows the user's face flanked by that hypothesis's palette so the viewer can compare which palette draws light to the face most evenly before locking a season.`,
+        lockedDecisions,
+        `Per-hypothesis details (canonical data, do not modify):
+
+${hypothesisDetails}`,
         `LAYOUT (build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "PALETTE CALIBRATION" and a thin horizontal divider below.
-- Main region: 8 photorealistic portrait try-on tiles arranged in a 4-column by 2-row grid. Each tile shows the SAME person from Image 1, head-and-shoulders, wearing only a solid top in that tile's color.
-- Tile composition (8 tiles total):
-  - Pick 3 Signature swatches yourself for "Best" tiles. Vary depth and saturation across the 3 picks.
-  - Pick 2 Accent swatches yourself for "Good" tiles.
-  - Pick 3 Avoid swatches yourself for "Skip" tiles.
-- Below each tile: a thin colored band exactly matching the tile's hex, the swatch name in small caps on the band, and a single-line layout below with:
-  - A small badge (small green check + "BEST" for Signature picks, small grey circle + "GOOD" for Accent picks, small grey "skip" dot + "SKIP" for Avoid picks)
-  - A 2-3 word verdict caption you compose for this specific person and swatch (positive for Best, neutral-positive for Good, kind-descriptive for Skip; never insulting; never the word "avoid")
-- Bottom card "QUICK READ" (about 14% of canvas height): rounded soft-shadow card on slightly lighter cream. Heading "QUICK READ" small-caps. Below: 3 short lines, one each for depth, contrast, and undertone, written for this specific person (e.g. "Depth: ${portrait.depth.value} - leans into rich, full-bodied colors"). Compose each line dynamically.`,
-        tileAnchor("solid top color"),
+- Top band (~10% canvas height): small-caps eyebrow "PALETTE CALIBRATION", thin horizontal divider below.
+- Main region: ${N} stacked horizontal panels, each ~${panelHeightPct}% of canvas height. Panels are ordered top-to-bottom matching the hypothesis order in the per-hypothesis details block above.
+- Each panel contains:
+  - Top of panel: the hypothesis name (medium serif) and a small confidence chip in small-caps ("HIGH", "MEDIUM", or "LOW").
+  - Center of panel: a head-and-shoulders portrait of the SAME person from Image 1, occupying the middle horizontal third of the panel. Flanking the portrait, two vertical "drape" stripes:
+    - LEFT stripe (~12% panel width): the hypothesis's Best Neutrals stacked top-to-bottom, one solid block per swatch, full-bleed against the panel edge.
+    - RIGHT stripe (~12% panel width): the hypothesis's Signature Colors stacked top-to-bottom, one solid block per swatch, full-bleed against the panel edge.
+  - Bottom of panel: a horizontal row of the hypothesis's Accent Colors (one solid square per accent, evenly spaced), each labeled below with its hex code in small monospace. Above the accent row, two stacked lines (composed from the hypothesis's canonical positioning fields when provided):
+    - "Why: <one or two of this hypothesis's supporting signals, rephrased in plain language>".
+    - Tiny italic positioning sub-line in mid-gray: distill the Munsell positioning or skin-texture metaphor into ONE short clause (e.g. "high value, moderate chroma" or "frosted-glass quality"). If neither is provided for this hypothesis, omit the sub-line entirely — do not invent.
+  - If the hypothesis has a "Confidence caveat" in its details block, render it as a tiny RIGHT-aligned monospace small-caps badge in the panel's bottom-right corner (e.g. "TRAITS HIGH · HEX MEDIUM"). Otherwise omit.
+- Bottom band (~6% canvas height): small italic note "Lock the hypothesis that draws light to your face most evenly."`,
+        tileAnchor(
+          "palette drape (face is identical across panels; only the surrounding palette changes)"
+        ),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Every tile color uses an exact hex from the swatches above. Color name labels match the swatch names.
-- Same person across all 8 tiles, drawn from Image 1. Same crop, same lighting, same neutral expression.
-- No red Xs, no "Avoid" / "Bad" / "Ugly" wording inside the grid. Use "SKIP" badge with kind descriptive verdicts.
-- Do NOT copy the person, swatches, or text from the layout reference. Replace all of it with the user's content.
+- Every drape, neutral, signature, and accent color uses an exact hex from the per-hypothesis details. Do not invent, shift, or substitute hex values.
+- Same person across all ${N} panels, drawn from Image 1. Same crop, same lighting, same neutral expression. The only thing that changes between panels is the surrounding palette drape.
+- Render exactly ${N} panels, one per listed hypothesis, in the listed order. Do not add a "winner" tile, "vs" overlay, or extra comparison element.
+- No red Xs, no "Avoid" / "Bad" / "Wrong" wording. The Calibration board is a comparison tool, not a judgment.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Same person across all 8 tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features, age.",
-          "Identical head-and-shoulders crop, same camera angle, same neutral expression.",
-          "Identical neutral background and identical soft lighting across tiles.",
-          "Every tile color uses an exact hex from the swatches list above.",
-          "Tile counts: 3 Best (Signature), 2 Good (Accent), 3 Skip (Avoid)."
+          `Same person across all ${N} panels. Same eyes, brows, nose, mouth, skin tone, ethnic features, age, hair color and length.`,
+          "Identical head-and-shoulders crop, same camera angle, same neutral expression in every panel.",
+          "Identical neutral background and identical soft lighting across panels — only the palette drape changes.",
+          "Every drape, neutral, signature, and accent swatch matches an exact hex from its hypothesis's palette in the per-hypothesis details block above.",
+          `Render exactly ${N} hypothesis panels — no more, no fewer.`
         ])
       ]);
     }
   },
   {
+    // === STEP: Makeup Shade Guide ===
     title: "Makeup Shade Guide",
-    description: "Foundation, concealer, blush, eyeshadow, lip, and brow recommendations.",
+    description:
+      "Presentation-gated shade direction. Feminine variant: 7 makeup sections (foundation/concealer/blush/eyeshadow/eyeliner-mascara/brow/lip). Masculine variant: 5 grooming sections (skin tonics/lip balm/beard care/eyebrow direction/complexion enhancers).",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
+    buildPrompt: ({ portrait, userProfile }) => {
+      const plan = selectMakeupPlan(portrait, userProfile);
+      const {
+        variant,
+        userUndertone,
+        userDepth,
+        userChroma,
+        userContrast,
+        makeupSelections,
+        groomingSelections
+      } = plan;
+
+      const isGrooming = variant === "grooming";
+      const reportTitle = isGrooming ? "Grooming & Shade Guide" : "Makeup Shade Guide";
+
+      const sectionDecisions = isGrooming
+        ? groomingSelections.map((sel) => ({
+            label: sel.section.name,
+            details: sel.section.goal
+          }))
+        : makeupSelections.map((sel) => ({
+            label: sel.section.name,
+            details: sel.section.goal
+          }));
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: isGrooming ? "grooming sections" : "makeup sections",
+        decisions: sectionDecisions,
+        doNotInventClause:
+          "Render exactly these sections in the order given. Do not add a section, merge sections, or invent new shade categories."
+      });
+
+      const makeupSectionDetails = makeupSelections
+        .map((sel, i) => {
+          const safe = sel.safeEntry?.guidance ?? "(no canonical safe-everyday match for this undertone × depth)";
+          const statement = sel.statementEntry?.guidance ?? "(no canonical statement match)";
+          const lines = [
+            `Section ${i + 1}: ${sel.section.name} (id: ${sel.section.id})`,
+            `- Goal: ${sel.section.goal}`,
+            `- Safe everyday for ${userUndertone} × ${userDepth}: ${safe}`,
+            `- Statement for ${userUndertone}: ${statement}`,
+            `- Finish guidance: ${sel.section.finishGuidance.join(" / ")}`,
+            `- Use carefully: ${sel.section.useCarefully.join(" / ")}`
+          ];
+          if (sel.section.glassesFrameInteraction?.length) {
+            lines.push(
+              `- Glasses / frame interaction: ${sel.section.glassesFrameInteraction.join(" / ")}`
+            );
+          }
+          if (sel.section.hairColorCrossReference?.length) {
+            lines.push(
+              `- Hair-color cross-reference: ${sel.section.hairColorCrossReference.join(" / ")}`
+            );
+          }
+          return lines.join("\n");
+        })
+        .join("\n\n");
+
+      const groomingSectionDetails = groomingSelections
+        .map((sel, i) => {
+          const lines = [
+            `Section ${i + 1}: ${sel.section.name} (id: ${sel.section.id})`,
+            `- Goal: ${sel.section.goal}`
+          ];
+          if (sel.undertoneDirection) {
+            lines.push(`- Direction for ${userUndertone}: ${sel.undertoneDirection}`);
+          }
+          if (sel.undertoneDepthEntry) {
+            lines.push(
+              `- Direction for ${userUndertone} × ${userDepth}: ${sel.undertoneDepthEntry.guidance}`
+            );
+          }
+          if (!sel.undertoneDirection && !sel.undertoneDepthEntry) {
+            lines.push(`- (no canonical direction match for this user)`);
+          }
+          if (sel.section.hairColorCrossReference?.length) {
+            lines.push(
+              `- Hair-color cross-reference: ${sel.section.hairColorCrossReference.join(" / ")}`
+            );
+          }
+          lines.push(`- Use carefully: ${sel.section.useCarefully.join(" / ")}`);
+          if (sel.section.notes.length) {
+            lines.push(`- Notes: ${sel.section.notes.join(" / ")}`);
+          }
+          return lines.join("\n");
+        })
+        .join("\n\n");
+
+      const sectionDetails = isGrooming ? groomingSectionDetails : makeupSectionDetails;
+      const sectionCount = isGrooming ? groomingSelections.length : makeupSelections.length;
+      const planNote = `Planner: variant "${variant}" (gated on presentation: ${portrait.presentation.value}${userProfile?.presentation ? `, user-stated: ${userProfile.presentation}` : ""}). User traits — undertone: ${userUndertone}, depth: ${userDepth}, chroma: ${userChroma}, contrast: ${userContrast}.`;
+
+      // FEATURE CLOSE-UPS: 4 identity-preserved tiles that visualize the most
+      // relevant sections on the user's face, with shade swatches alongside.
+      type CloseUp = {
+        label: string;
+        region: string;
+        sectionId: string;
+        guidance: string;
+        extraNote?: string;
+        extraNoteLabel?: string;
+      };
+
+      const findMakeupSection = (id: string) =>
+        makeupSelections.find((s) => s.section.id === id);
+      const findGroomingSection = (id: string) =>
+        groomingSelections.find((s) => s.section.id === id);
+
+      let closeUps: CloseUp[];
+      if (isGrooming) {
+        const browSel = findGroomingSection("eyebrow-direction");
+        const beardSel = findGroomingSection("beard-care");
+        const skinTonicsSel = findGroomingSection("skin-tonics");
+        const lipBalmSel = findGroomingSection("lip-balm");
+        const complexionSel = findGroomingSection("complexion-enhancers");
+        const hasBeard = portrait.facialHair.value !== "None";
+
+        closeUps = [
+          {
+            label: "BROW",
+            region:
+              "eyebrow region close-up (brow + just below the brow line, eyes closed or relaxed)",
+            sectionId: "eyebrow-direction",
+            guidance:
+              browSel?.undertoneDepthEntry?.guidance ??
+              browSel?.undertoneDirection ??
+              "(no canonical guidance match)",
+            extraNoteLabel: "Hair color match",
+            extraNote: browSel?.section.hairColorCrossReference?.[0]
+          },
+          hasBeard
+            ? {
+                label: "BEARD",
+                region:
+                  "jaw + chin close-up showing beard texture (no full face, just lower half)",
+                sectionId: "beard-care",
+                guidance:
+                  beardSel?.undertoneDepthEntry?.guidance ??
+                  "(no canonical beard-care match)"
+              }
+            : {
+                label: "SKIN CARE",
+                region:
+                  "clean-shaven jaw + cheek close-up (lower half of face, no beard)",
+                sectionId: "skin-tonics",
+                guidance:
+                  skinTonicsSel?.undertoneDirection ??
+                  "(no canonical skin-tonic match)"
+              },
+          {
+            label: "LIP BALM",
+            region: "closed-mouth lip area close-up (lips at rest, no makeup)",
+            sectionId: "lip-balm",
+            guidance:
+              lipBalmSel?.undertoneDirection ?? "(no canonical lip-balm match)"
+          },
+          {
+            label: "COMPLEXION",
+            region:
+              "cheekbone area close-up (cheek + side of face, no full features)",
+            sectionId: "complexion-enhancers",
+            guidance:
+              complexionSel?.undertoneDepthEntry?.guidance ??
+              "(no canonical complexion-enhancer match)"
+          }
+        ];
+      } else {
+        const browSel = findMakeupSection("brow");
+        const eyeSel = findMakeupSection("eyeshadow");
+        const blushSel = findMakeupSection("blush");
+        const lipSel = findMakeupSection("lip");
+        closeUps = [
+          {
+            label: "BROW",
+            region: "eyebrow region close-up (brow + just below the brow line)",
+            sectionId: "brow",
+            guidance:
+              browSel?.safeEntry?.guidance ?? "(no canonical brow match)",
+            extraNoteLabel: "Hair color match",
+            extraNote: browSel?.section.hairColorCrossReference?.[0]
+          },
+          {
+            label: "EYE",
+            region: "eye + lash + lid close-up (eyes open, brow visible)",
+            sectionId: "eyeshadow",
+            guidance:
+              eyeSel?.safeEntry?.guidance ?? "(no canonical eyeshadow match)",
+            extraNoteLabel: "With glasses",
+            extraNote: eyeSel?.section.glassesFrameInteraction?.[0]
+          },
+          {
+            label: "BLUSH",
+            region: "cheekbone close-up (cheek + side of face, no full lips)",
+            sectionId: "blush",
+            guidance:
+              blushSel?.safeEntry?.guidance ?? "(no canonical blush match)"
+          },
+          {
+            label: "LIP",
+            region:
+              "closed-mouth lip area close-up (lips at rest, neutral expression)",
+            sectionId: "lip",
+            guidance: lipSel?.safeEntry?.guidance ?? "(no canonical lip match)"
+          }
+        ];
+      }
+
+      const closeUpsBlock = `Feature close-ups (4 identity-preserved tiles in the row above the section grid; render exactly these 4 in this order, with the safe-everyday guidance driving 2–3 representative swatches per tile):
+
+${closeUps
+  .map((cu, i) => {
+    const lines = [
+      `Tile ${i + 1} — ${cu.label}: ${cu.region}`,
+      `  Linked canonical section: ${cu.sectionId}`,
+      `  Safe-everyday guidance for this user: ${cu.guidance}`
+    ];
+    if (cu.extraNote && cu.extraNoteLabel) {
+      lines.push(`  ${cu.extraNoteLabel}: ${cu.extraNote}`);
+    }
+    return lines.join("\n");
+  })
+  .join("\n\n")}`;
 
       return compose([
         imageRoles(null),
         personLock(portrait),
-        portrait.presentation.value === "Masculine"
-          ? "Generate a 1024x1536 photorealistic GROOMING & SHADE GUIDE infographic for a masculine-presenting user. Reframe the report as grooming-focused: skin tone, brow shape and shaping, lip balm tones, beard care notes (if facial hair is present), subtle complexion shade notes. Do NOT render full makeup looks (no eyeshadow palettes, no lipsticks, no full glam). Replace 'Lip Color Options' with 'Lip Balm / Tinted Balm Tones'. Replace 'Eyeshadow Palette' with 'Subtle Brow & Lash Tones'. Replace 'Blush Options' with 'Healthy Complexion Notes' (light bronzer, healthy flush). Build the page from the written layout instructions."
-          : "Generate a 1024x1536 photorealistic makeup shade guide infographic, using the user's portrait(s) for identity and the written layout instructions for structure.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Depth: ${portrait.depth.value}
-- Contrast: ${portrait.contrast.value}
-- Undertone: ${portrait.undertone.displayLabel}
-- Hair color: ${portrait.hairColor}
-- Eye color: ${portrait.eyeColor}`,
-        `Reference palette colors. Use these to inform eyeshadow and lip picks where they harmonize:
-- Signature colors: ${swatchList(portrait.palette.signatureColors)}
-- Accent colors: ${swatchList(portrait.palette.accentColors)}`,
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 ${reportTitle}. Hybrid mode: a top row of 4 identity-preserved feature close-ups (BROW / EYE / BLUSH / LIP for makeup; BROW / BEARD or SKIN CARE / LIP BALM / COMPLEXION for grooming), followed by a structured section grid of ${sectionCount} canonical ${isGrooming ? "grooming" : "makeup"} sections, and a tying summary line that ties the user's traits together. The page combines visual feature context with detailed canonical shade direction keyed to undertone × depth × chroma. Brand-agnostic and SKU-agnostic — shade families and ranges only, never invented foundation numbers or product names.`,
+        lockedFragment,
+        `Per-section canonical details (do not modify; paraphrase only for legibility):
+
+${sectionDetails}`,
+        closeUpsBlock,
+        planNote,
+        `Use these analysis values exactly:
+- Visible presentation: ${portrait.presentation.value}
+- Undertone (canonical): ${userUndertone}
+- Depth (canonical): ${userDepth}
+- Chroma (locked palette): ${userChroma}
+- Contrast (canonical): ${userContrast}
+- Hair color (preserve in render if any portrait inset): ${portrait.hairColor}
+- Eye color: ${portrait.eyeColor}
+- Facial hair (relevant for ${isGrooming ? "beard care" : "presentation"}): ${portrait.facialHair.value}`,
         `LAYOUT (build from these instructions, no layout reference image):
-- Top band: extra-large bold serif heading "MAKEUP SHADE GUIDE" with small-caps eyebrow "CUSTOMIZED FOR YOU".
-- Three-column body region:
-
-  LEFT COLUMN (about 32% width):
-  - "FOUNDATION SHADE RANGE" card: small-caps heading; sub-header descriptor that matches ${portrait.depth.value} depth (compose phrasing such as "Light to Medium" for lighter depths, "Medium to Deep" for deeper depths). 5 horizontal foundation brush-stroke swatches stacked vertically, labeled 1.0 through 5.0 with short shade names progressing from lighter to deeper on the ${portrait.undertone.displayLabel} undertone direction. Mark the BEST shade for this user with a thicker border around its swatch (do NOT use a circle overlay).
-  - "CONCEALER RECOMMENDATION" card: heading; sub-header "1 Shade Lighter"; a single brush-stroke swatch beside a 1-line label that names the depth tier and undertone direction (e.g. "${portrait.depth.value} (${portrait.undertone.value.toLowerCase()} undertone)").
-  - "BLUSH OPTIONS" card: heading; sub-header "Natural to Bold"; 4 circular blush swatches arranged horizontally, each with a 1-2 word name beneath. Compose 4 blush names that harmonize with ${portrait.undertone.displayLabel}, ranging from natural everyday to bolder evening.
-
-  CENTER COLUMN (about 36% width): a large photorealistic head-and-shoulders portrait of the user from Image 1, centered vertically. Plain neutral background. Preserve identity exactly.
-
-  RIGHT COLUMN (about 32% width):
-  - "EYESHADOW PALETTE" card: heading; 6 square eyeshadow swatches arranged in a 3-column by 2-row grid, each with a 1-2 word name beneath. Compose 6 wearable shades that draw from or harmonize with the user's Signature and Accent palette above.
-  - "LIP COLOR OPTIONS" card: heading; sub-header "Nude to Statement"; 6 horizontal lipstick swatches stacked vertically, each labeled with a 1-2 word name. Compose 6 names ranging from nude to statement, all harmonizing with ${portrait.undertone.displayLabel}.
-
-- Bottom row (split into two cards):
-  - "UNDERTONE ANALYSIS" card (about 60% width, rounded soft-shadow): small-caps heading; large bold value "${portrait.undertone.displayLabel.toUpperCase()}"; 3 short rows below, each with a small icon + 1-line indicator describing a visible undertone signal (skin cast, vein color, jewelry preference, etc.); a final summary line in 11px sans-serif: "You look best in [list 3-4 shade families]." Compose all three indicator lines and the summary dynamically for this user.
-  - "BROW RECOMMENDATION" card (about 40% width, rounded soft-shadow): small-caps heading; sub-header naming the recommended brow depth range tied to "${portrait.hairColor}"; a brow brush-stroke swatch in that color; small label below the swatch ("Neutral-Warm Undertone" / similar phrasing tailored to ${portrait.undertone.displayLabel}).`,
+- Top band (~7% canvas height): small-caps eyebrow "${reportTitle.toUpperCase()}", thin horizontal divider below. Right side: monospace small-caps chip showing "${userUndertone.toUpperCase()} · ${userDepth.toUpperCase()} · ${userChroma.toUpperCase()}". Tiny mono "VARIANT: ${variant.toUpperCase()}" line below the divider.
+- FEATURE CLOSE-UPS row (~28% canvas height): 4 columns, one per close-up tile listed in the feature-close-ups block above. Each tile renders, top to bottom:
+  1. Photorealistic close-up of the listed feature on the user (identity preserved exactly; same person from Image 1; soft warm studio lighting; neutral cream background; no over-retouch). The close-up is tightly cropped to JUST the listed region — not the full face.
+  2. Tile label in small-caps tracked below the photo (e.g., "BROW", "EYE", "BLUSH", "LIP", "BEARD", "SKIN CARE", "LIP BALM", "COMPLEXION").
+  3. A row of 2–3 small color swatches (~28px each) drawn from the canonical safe-everyday guidance for that tile's section. Render representative shades that match the descriptive guidance text.
+  4. Two short shade-name lines (1–2 words each, drawn from the canonical guidance phrasing) below the swatches.
+  5. Optional small tooltip line at the bottom of the tile: hair-color cross-reference (BROW tile) or glasses interaction (EYE tile, makeup variant only) — render in tiny mono caps if the canonical extra is present.
+- Identity preservation across all 4 close-ups is critical: same person, same skin tone, same scale of feature crop, no glamming-up, no over-retouch.
+- SECTION GRID (~50% canvas height): ${sectionCount} stacked sections in ${isGrooming ? "a 1-column" : "a 2-column"} layout (one section per ${isGrooming ? "row" : "card"}). Order matches the per-section details list above. Each section card has:
+  - Small-caps heading with the section name.
+  - Tiny mono "GOAL: <one-line goal>" under the heading.
+  - "SAFE EVERYDAY" sub-block: a row of ${isGrooming ? "1–2" : "3–5"} swatch chips representing the canonical guidance for this user's traits. Each swatch is a small color disc with a 1–2 word descriptive label below (drawn from the canonical guidance text).
+  - ${isGrooming ? "" : '"STATEMENT" sub-block: 1-2 swatch chips representing the canonical statement guidance.\n  - '}"FINISH" line: tiny mono caps stating the recommended finish from the section's finishGuidance.
+  - "USE CAREFULLY" footer line: italic small caps, drawn from the canonical use-carefully list.
+${isGrooming ? "" : "- Sections that have canonical glassesFrameInteraction guidance (Eyeshadow, Eyeliner & Mascara) include a small \"WITH GLASSES\" tooltip line.\n- Sections that have canonical hairColorCrossReference (Brow) include a tiny \"HAIR COLOR\" reference line."}
+${isGrooming ? "- The Eyebrow Direction section includes a tiny \"HAIR COLOR\" reference line (canonical hairColorCrossReference).\n- Each section's \"NOTES\" line appears in italic at the bottom of the card." : ""}
+- TYING SUMMARY (~6% canvas height): single italic line in serif type, centered, that ties the user's locked-palette traits into one stylistic statement. Compose dynamically grounded in undertone "${userUndertone}", depth "${userDepth}", chroma "${userChroma}", and contrast "${userContrast}". Example shape (do NOT copy verbatim): "Soft Autumn coloring at medium depth glows in muted warm peach and sage tones with satin finishes."
+- Bottom band (~3% canvas height): single italic concluding line — for makeup variant: "Shade direction, not exact product matching. Brand pick happens at the counter." — for grooming variant: "Subtle direction, no full glam. Real products picked at fitting time."`,
+        tileAnchor("feature crop (face is identical across all 4 close-up tiles; only the cropped region and the swatches alongside it change)"),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- No brand names. No prices. No medical or skin-treatment claims.
-- Mark the best foundation shade with a thicker border, not a circle overlay.
-- Center portrait reads as the same person from Image 1; do not over-retouch skin.
-- Do NOT copy text content (shade names, undertone label, recommendations) from the layout reference. Compose all of it for this specific user.
+- HYBRID MODE: the FEATURE CLOSE-UPS row at the top renders 4 identity-preserved feature crops of the user. The SECTION GRID below remains pure swatch + text — no person, no model, no full made-up face.
+- Identity preservation across the 4 close-ups: same person from Image 1, same skin tone, same scale of feature crop, no over-retouch, no skin smoothing that changes apparent age.
+- Close-up tiles are TIGHT CROPS of the listed region — not full faces. The user is recognizable across tiles by feature continuity, not by having the entire face rendered.
+- ${isGrooming ? "GROOMING VARIANT: do NOT apply lipstick, eyeshadow, or full glam to any close-up. The LIP BALM tile shows tinted balm direction (subtle), the BROW tile shows brow grooming direction (no fill), the BEARD tile shows beard care tone (or clean skin if no beard), the COMPLEXION tile shows subtle skin tints — never full makeup." : "MAKEUP VARIANT: close-ups show the user with shade direction visible (subtle blush on the cheek tile, subtle eye shadow on the eye tile, etc.) but never heavy editorial makeup."}
+- NO brand names, NO product SKUs, NO exact foundation numbers (e.g., do not invent "Estée Lauder 2W1" or any specific product code). Shade families and ranges only.
+- Every shade direction must trace to the canonical per-section details above. Do not invent guidance for undertone × depth combinations not represented.
+- "Use carefully" sections must NOT use words like "Avoid", "Bad", or "Wrong" — frame as conditional cautions.
+- TYING SUMMARY line is composed dynamically grounded in the user's traits; do not copy the example phrasing verbatim.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Center portrait must read as the same person from the user's portrait(s).",
-          `Undertone printed in the bottom card is exactly: ${portrait.undertone.displayLabel.toUpperCase()}.`,
-          `Foundation depth scale is anchored at ${portrait.depth.value}; the marked best shade matches this depth.`,
-          "All swatch labels are 1-2 words; numeric labels (1.0-5.0) appear only on the foundation row."
+          `Report title is exactly: "${reportTitle}".`,
+          `Variant line reads: VARIANT: ${variant.toUpperCase()}.`,
+          `Trait chip reads: ${userUndertone.toUpperCase()} · ${userDepth.toUpperCase()} · ${userChroma.toUpperCase()}.`,
+          `Render exactly 4 feature close-up tiles in the order: ${closeUps.map((cu) => cu.label).join(" / ")}.`,
+          "Same person across all 4 close-ups, identity preserved, no over-retouch.",
+          `Render exactly ${sectionCount} ${isGrooming ? "grooming" : "makeup"} sections in the section grid below the close-ups; no extras, no omissions.`,
+          "No brand names, no SKUs, no exact foundation numbers anywhere on the page.",
+          "Each section's content matches the canonical per-section details; do not invent shade families.",
+          "Tying summary line is composed for this specific user; not a copy of the example phrasing."
         ])
       ]);
     }
   },
+  // "Nail Color Guide" was retired here — it required a hand-photo upload,
+  // legacy palette fields, and was not part of the canonical pipeline.
   {
-    title: "Nail Color Guide",
-    description: "Twelve nail color options shown on the user's hand, with three best picks marked.",
-    reference: "hand",
-    requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
-
-      return compose([
-        imageRoles("Nail Color Guide", {
-          primaryReference: "the user's primary portrait",
-          primaryUse:
-            "Use it only for color harmony, undertone, and visible presentation. Do not render the face in the nail tiles.",
-          intermediateReferences:
-            "Any images after Image 1 and before the LAST image include optional additional portrait angles followed by the user's HAND PHOTO. The user image immediately before the LAST image is the hand reference: use it as the HAND, NAIL SHAPE, SKIN TONE, and POSE reference for every hand rendered in the output.",
-          separationRule:
-            "do NOT copy the hand, nail shape, nail colors, skin tone, or pose from the layout reference"
-        }),
-        personLock(portrait),
-        "Generate a 1024x1536 photorealistic nail color guide. Use the user's hand photo, immediately before the layout reference, as the hand identity reference for every tile. The LAYOUT REFERENCE shows the 4-column by 3-row tile arrangement, captions, and best-match badges.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Undertone: ${portrait.undertone.displayLabel}
-- Depth: ${portrait.depth.value}
-- Season: ${portrait.colorSeason.value}`,
-        `Reference palette colors. Use these to inform 3 of the 12 nail picks (the ones that match the user's undertone most closely):
-- Signature colors: ${swatchList(portrait.palette.signatureColors)}
-- Accent colors: ${swatchList(portrait.palette.accentColors)}`,
-        `LAYOUT (follow the LAYOUT REFERENCE):
-- Top band: extra-large bold serif heading "NAIL COLOR GUIDE" with small-caps eyebrow "FIND YOUR PERFECT SHADE" and a small decorative divider below.
-	- Main grid: 12 tiles in a 4-column by 3-row layout. Each tile shows a close-up photograph of the SAME hand from the hand photo with all visible nails painted in that tile's polish color. Same fingers, same skin tone, same hand position across all 12 tiles; only the nail color changes.
-- Below each tile (centered):
-  - A number "1." through "12."
-  - The polish color name in 1-3 words (compose dynamically; do NOT copy from the layout reference)
-  - A small rounded-pill use-case tag in 1-2 words: "classic", "everyday", "office", "bold", "evening", "date night", or "special"
-- Color selection (12 total, model picks):
-  - Pick 12 distinct nail polish colors that show real range across categories: classic red, dusty/soft rose, deep burgundy or wine, nude or peachy pink, warm terracotta or cognac, bright coral or orange, forest green or jewel-tone green, navy or jewel-tone blue, mauve or muted purple, chocolate brown, clear gloss, and french manicure.
-  - At least 3 of the 12 must be picks that genuinely flatter ${portrait.undertone.displayLabel} undertone and the season "${portrait.colorSeason.value}". Mark each of those 3 best picks with a subtle thin ring outlining the entire tile (NOT a circle overlay on the nails themselves) and a small star icon in the corner.
-  - The remaining 9 are part of the broader range; do not mark them.`,
-        `IDENTITY ANCHOR (hard requirement across all 12 tiles):
-- Same hand in every tile, drawn from the hand photo. Same fingers visible, same skin tone, same hand pose, same nail shape, same nail length.
-- Each hand has exactly five fingers; nails are clean and even on every hand shown.
-- Only the polish color changes between tiles.
-- Lighting and background are consistent across tiles.`,
-        STYLE_BLOCK,
-        `Hard rules:
-- All text must be legible English. No gibberish, no warped letters.
-- No brand names. No fake product codes. No prices.
-- Hands have exactly five fingers in every tile.
-- Best-pick badge is a thin tile outline ring + corner star, not a circle overlay on the nails.
-- Do NOT copy nail color names or use-case tags from the layout reference; compose them for this user.
-- Do not mention that this is AI-generated.`,
-        preserveRepeat([
-          "Same hand from the hand photo across all 12 tiles. Same fingers, same skin tone, same pose.",
-          "Five fingers per hand in every tile, no extra or missing digits.",
-          "Exactly 3 of the 12 tiles are marked as best picks via tile-outline ring + corner star.",
-          `Best picks are chosen because they flatter ${portrait.undertone.displayLabel} undertone and ${portrait.colorSeason.value}.`
-        ])
-      ]);
-    }
-  },
-  {
+    // === STEP: Accessory & Jewelry Metals Guide ===
     title: "Accessory & Jewelry Metals Guide",
-    description: "Compare four metals on the same portrait and recommend accessories in the best metal.",
+    description: "Visual metal comparison + canonical finish guidance, mixed-metal rules, and face-shape watch guidance. Identity-required, single-crop reuse.",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const metalOrder = ["Gold", "Silver", "Rose Gold", "Brass/Bronze"] as const;
-      const verdictLines = metalOrder
-        .map((metal) => `- ${metal}: ${portrait.metalVerdicts[metal]}`)
-        .join("\n");
+    buildPrompt: ({ portrait, userProfile }) => {
+      const plan = selectJewelryPlan(portrait, userProfile);
+      const {
+        bestMetalAssessment,
+        metalsToCompare,
+        recommendedFinishes,
+        mixedMetalsCombinations,
+        mixedMetalsRules,
+        watchGuidance,
+        userUndertone,
+        userChroma
+      } = plan;
+
+      const metalDecisions = metalsToCompare.map((m) => ({
+        label: `${m.metalName} (${m.legacyName})`,
+        details: `${m.canonicalMatch.toUpperCase()} fit · model verdict: ${m.modelVerdict}`
+      }));
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "metal comparison tiles",
+        decisions: metalDecisions,
+        doNotInventClause:
+          "Render exactly these 4 metal comparison tiles in the order given. Do not add a 5th metal, swap names, or invent new fits."
+      });
+
+      const metalDetails = metalsToCompare
+        .map(
+          (m, i) =>
+            `Metal ${i + 1}: ${m.metalName} (legacy label: "${m.legacyName}", family: ${m.family})
+- Canonical fit for this user: ${m.canonicalMatch} (user undertone "${userUndertone}" vs canonical bestForUndertones list)
+- Model verdict: ${m.modelVerdict}
+- Recommended finishes: ${m.finishOptions.join(", ")}
+- Watch out: ${m.watchOut}${m.notes ? `\n- Notes: ${m.notes}` : ""}`
+        )
+        .join("\n\n");
+
+      const finishBlock =
+        recommendedFinishes.length > 0
+          ? `Recommended finishes for ${userChroma} chroma (canonical, do not invent):
+${recommendedFinishes
+  .map(
+    (f) =>
+      `- ${f.name} (${f.id}): pairs with ${f.pairsWithMetals.slice(0, 4).join(", ")}; best for ${f.bestForOccasions.join(", ")}; use carefully — ${f.useCarefully}`
+  )
+  .join("\n")}`
+          : "(no canonical finish recommendations available for this chroma)";
+
+      const mixBlock =
+        mixedMetalsCombinations.length > 0
+          ? `Mixed-metal combinations for ${bestMetalAssessment.metalName} (canonical, do not invent):
+${mixedMetalsCombinations.map((c) => `- ${c}`).join("\n")}
+
+Mixing rules (canonical):
+${mixedMetalsRules.map((r) => `- ${r}`).join("\n")}`
+          : "(no canonical mixed-metal combinations available)";
+
+      const watchBlock = watchGuidance
+        ? `Watch guidance for ${portrait.faceShape.value} faces (canonical):
+- Best case sizes: ${watchGuidance.bestCaseSizes}
+- Best case shapes: ${watchGuidance.bestCaseShapes.join(", ")}
+- Best strap materials: ${watchGuidance.bestStrapMaterials.join(", ")}
+- Use carefully: ${watchGuidance.useCarefully}`
+        : `(no canonical watch guidance available for face shape "${portrait.faceShape.value}")`;
 
       return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic accessory and jewelry metals guide, using the user's portrait(s) for identity and the written layout instructions for structure.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Undertone: ${portrait.undertone.displayLabel}
-- Contrast: ${portrait.contrast.value}
-- Best metal: ${portrait.bestMetal.value}`,
-        `Metal verdicts (data values; use them to choose each visible badge):
-${verdictLines}`,
-        `LAYOUT (build from these instructions, no layout reference image):
-- Top band: extra-large bold serif heading "ACCESSORY & JEWELRY METALS GUIDE" with a small italic tagline below: "Find the metals that flatter you most".
-- Main row: 4 photorealistic portrait tiles in a 4-column by 1-row arrangement. Each tile shows the SAME person from Image 1, head-and-shoulders, wearing visible earrings and a delicate pendant necklace in that tile's metal tone. Plain neutral cream background, soft warm lighting, neutral expression. Only the metal of the jewelry changes between tiles.
-- Tile order left to right: Gold, Silver, Rose Gold, Brass/Bronze.
-- Below each tile, on the cream background:
-  - A horizontal colored band rendering the metal's actual surface tone (warm yellow gold / cool silver / soft pink rose gold / warm muted brass-bronze) with the metal name in bold caps centered on the band.
-  - A small badge row beneath the band:
-    - For "Best" verdict: a small gold star icon + "YOUR BEST METAL" in small caps
-    - For "Strong" verdict: a small green check icon + "STRONG" in small caps
-    - For "Good" verdict: a small grey filled circle + "GOOD" in small caps
-    - For "Skip" verdict: a small grey "skip" dot + "SKIP" in small caps
-  - A 1-line reason in 11px sans-serif, composed dynamically for this metal and this user, grounded in ${portrait.undertone.displayLabel} undertone and ${portrait.contrast.value} contrast. Examples of reason shape (do not copy verbatim): "Warms your complexion", "Cools your complexion", "Less harmonious with your undertone", "Competes with your undertone".
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 photorealistic Accessory & Jewelry Metals Guide. Identity-required mode: render the SAME person from Image 1 in 4 metal-comparison tiles. The page combines visual metal try-ons (top) with canonical finish guidance, mixed-metal rules, and face-shape watch guidance (bottom).`,
+        lockedFragment,
+        `Per-metal canonical details (do not modify):
 
-- Bottom card "RECOMMENDED ACCESSORIES IN YOUR BEST METAL: ${portrait.bestMetal.value.toUpperCase()}" (rounded soft-shadow card on slightly lighter cream, full width, about 30% canvas height):
-  - Heading in small-caps tracked across the top.
-  - Below the heading: 5 photorealistic product cutouts arranged horizontally, each on a clean cream background with no model, no scene. The 5 items: a wristwatch, a pair of earrings, a pendant necklace, a chain bracelet, and a ring. Every item is rendered in the ${portrait.bestMetal.value} metal tone.
-  - Below each cutout, centered, in small-caps tracked: "WATCH", "EARRINGS", "NECKLACE", "BRACELET", "RING".`,
-        `IDENTITY ANCHOR (hard requirement across all 4 portrait tiles):
-- Same person in every tile, drawn from Image 1. Same eyes, brows, nose, mouth, skin tone, freckles or moles, ethnic features, age.
-- Same head-and-shoulders crop, same camera angle, same neutral expression with closed-mouth or slight smile.
-- Same neutral top across all four tiles (a simple dark crewneck or scoop neck so the necklace is visible).
-- Same soft warm lighting and same plain cream background across tiles.
-- The only variable across the four portrait tiles is the metal of the jewelry.`,
+${metalDetails}`,
+        `Best metal direction (model + canonical agreement): ${bestMetalAssessment.metalName} (${bestMetalAssessment.legacyName}) — canonical fit "${bestMetalAssessment.canonicalMatch}", model verdict "${bestMetalAssessment.modelVerdict}".`,
+        finishBlock,
+        mixBlock,
+        watchBlock,
+        `Use these analysis values exactly. Do not re-derive them:
+- Undertone: ${portrait.undertone.displayLabel} (canonical: ${userUndertone})
+- Locked-palette chroma: ${userChroma}
+- Contrast: ${portrait.contrast.value}
+- Face shape: ${portrait.faceShape.value}
+- Hair color (preserve in render): ${portrait.hairColor}
+- Eye color (preserve in render): ${portrait.eyeColor}
+- Visible presentation: ${portrait.presentation.value}
+- Facial hair (preserve exactly): ${portrait.facialHair.value}`,
+        `LAYOUT (build from these instructions, no layout reference image):
+- Top band (~7% canvas height): small-caps eyebrow "JEWELRY & METALS GUIDE", thin horizontal divider below. Right side: monospace small-caps chip "${bestMetalAssessment.legacyName.toUpperCase()}" labeled "BEST DIRECTION" in tiny mono.
+- Main metal-comparison grid (~46% canvas height): 4 photorealistic portrait tiles in a 2-column × 2-row arrangement. Each tile shows the SAME person from Image 1, head-and-shoulders, wearing visible earrings, a delicate pendant chain, and a wristwatch (when visible at the crop) in that tile's metal tone. The user's face, expression, hair, skin tone, and crop are IDENTICAL across all 4 tiles — only the metal tone of the jewelry changes.
+- Tile order top-left to bottom-right: ${metalsToCompare.map((m) => m.legacyName).join(", ")}.
+- Below each tile, on a thin label band:
+  - Metal name in bold small-caps (matches legacy name exactly: "${metalsToCompare.map((m) => m.legacyName).join('", "')}").
+  - Two stacked chips (small mono caps):
+    - Canonical fit: "PRIMARY" / "SUPPORTING" / "USE CAREFULLY" — based on the canonical match listed above.
+    - Model verdict: "BEST" / "STRONG" / "GOOD" / "SKIP" — based on the model verdict listed above.
+  - One short rationale line (under 14 words) connecting metal to user's undertone "${userUndertone}" and locked-palette chroma "${userChroma}".
+- Finishes card (~14% canvas height): small-caps heading "RECOMMENDED FINISHES (${userChroma.toUpperCase()} CHROMA)" + a horizontal row of finish chips, one per recommended finish from the canonical list. Each chip shows the finish name in small caps and a tiny one-line "pairs with ..." note.
+- Mixed-metals callout (~12% canvas height): small-caps heading "MIXED-METAL COMBINATIONS". List the canonical combinations as numbered short lines, with the rationale text directly from canonical (do not paraphrase liberally).
+- Watch guidance footer (~12% canvas height): small-caps heading "WATCH FOR ${portrait.faceShape.value.toUpperCase()} FACES". Three short lines: case sizes, case shapes, strap materials, and a final tiny "use carefully" line — all from canonical.
+- Bottom band (~3%): single italic concluding line: "Mix metals with intent: one anchor, one accent, finish-aligned."`,
+        tileAnchor("metal (face is identical across tiles; only the jewelry metal tone changes)"),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-	- Visible badge labels under each metal MUST follow the badge system above: Best displays "YOUR BEST METAL"; Strong displays "STRONG"; Good displays "GOOD"; Skip displays "SKIP".
-- Best metal hardware row uses ${portrait.bestMetal.value} consistently for all 5 product cutouts.
-- Preserve facial identity, proportions, and skin texture. Do not over-retouch skin.
-- Do NOT copy text content (verdict labels, reason copy, accessory captions) from the layout reference. Compose all of it for this specific user.
-- No brand names, no prices, no fake product codes.
+- Identity-required mode: render the SAME person from Image 1 in every tile. Same crop, camera angle, lighting, neutral expression. ONLY the metal tone changes.
+- The 4 metals must match the listed legacy names exactly: ${metalsToCompare.map((m) => m.legacyName).join(", ")}. Do not add a 5th metal, swap names, or invent variants.
+- Canonical fit chips and model verdict chips MUST match the per-metal details above. Do not improvise the verdicts.
+- Finishes, mixed-metal combinations, and watch guidance use the EXACT canonical content listed above. Do not invent new finishes, combinations, or sizes.
+- Preserve facial identity, hair color (${portrait.hairColor}), facial hair (${portrait.facialHair.value}), and skin texture. Do not over-retouch.
+- "Use Carefully" / "Use Carefully" sections must NOT use words like "Avoid", "Bad", or "Wrong". Frame as conditional.
+- No brand names, no prices, no fake product codes or SKUs.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Same person across all 4 portrait tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features.",
-          "Identical head-and-shoulders crop, neutral top, neutral expression, plain cream background, soft warm lighting.",
-          `Metal data verdicts are represented visibly as: Gold=${portrait.metalVerdicts.Gold}, Silver=${portrait.metalVerdicts.Silver}, Rose Gold=${portrait.metalVerdicts["Rose Gold"]}, Brass/Bronze=${portrait.metalVerdicts["Brass/Bronze"]}. Best verdict displays "YOUR BEST METAL".`,
-          `Bottom card heading is exactly: "RECOMMENDED ACCESSORIES IN YOUR BEST METAL: ${portrait.bestMetal.value.toUpperCase()}".`,
-          `All 5 accessories in the bottom card are rendered in the ${portrait.bestMetal.value} metal tone.`
+          "Same person across all 4 metal-comparison tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features.",
+          "Identical head-and-shoulders crop, same camera angle, same neutral expression in every tile.",
+          `Best metal chip in the top band reads: ${bestMetalAssessment.legacyName.toUpperCase()}.`,
+          `4 metals shown, in this order: ${metalsToCompare.map((m) => m.legacyName).join(", ")}.`,
+          "Canonical fit chips per tile match the per-metal details (PRIMARY / SUPPORTING / USE CAREFULLY).",
+          "Model verdict chips per tile match the per-metal details (BEST / STRONG / GOOD / SKIP).",
+          `Hair color preserved exactly: ${portrait.hairColor}.`,
+          `Facial hair preserved exactly: ${portrait.facialHair.value}.`
         ])
       ]);
     }
   },
   {
+    // === STEP: Eyeglasses / Frames Guide ===
     title: "Eyeglasses / Frames Guide",
-    description: "Eight frame styles shown on the same person, with one best match marked.",
+    description: "Six identity-preserved frame try-ons selected from a 30-entry catalog: 5 flattering picks + 1 use-carefully educational example.",
     reference: "portrait",
     requires: { portrait: true },
-    buildPrompt: ({ portrait }) =>
-      compose([
+    buildPrompt: ({ portrait, userProfile }) => {
+      const { flattering, useCarefully, candidateCount } = selectFrames(portrait, userProfile);
+      const allEntries = [...flattering];
+      if (useCarefully) allEntries.push(useCarefully);
+      const N = allEntries.length;
+
+      const decisions = allEntries.map((entry) => ({
+        label: entry.name,
+        details:
+          entry === useCarefully
+            ? `USE CAREFULLY — ${entry.useCarefullyIf || "see notes"}`
+            : entry.notes || `${entry.shapeCategory}, ${entry.material}, ${entry.colorTone}`
+      }));
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "frames",
+        decisions,
+        doNotInventClause:
+          "Render exactly these frames in the order given. Do not invent new frame archetypes, swap colors, change materials, or substitute thicknesses."
+      });
+
+      const frameDetails = allEntries
+        .map((entry, i) => {
+          const isUseCarefully = entry === useCarefully;
+          const reasonLabel = isUseCarefully ? "Reason for use-carefully designation" : "Why this works";
+          const reasonText = isUseCarefully
+            ? entry.useCarefullyIf || `Shape category "${entry.shapeCategory}" sits in the use-carefully list for ${portrait.faceShape.value} faces.`
+            : entry.notes || `${entry.shapeCategory} works for ${portrait.faceShape.value} faces; ${entry.colorTone} harmonizes with this user's coloring.`;
+          return `Frame ${i + 1}: ${entry.name}${isUseCarefully ? " [USE CAREFULLY EXAMPLE]" : ""}
+- Shape category: ${entry.shapeCategory}
+- Material: ${entry.material} (${entry.thickness} thickness)
+- Color tone: ${entry.colorTone}
+- Bridge style: ${entry.bridgeStyle}
+- Reads as: ${entry.readsAs}
+- ${reasonLabel}: ${reasonText}`;
+        })
+        .join("\n\n");
+
+      const faceShapeId = portrait.canonicalFaceShape?.id;
+      const faceRules = faceShapeId ? EYEWEAR_RULES.byFaceShape[faceShapeId] : undefined;
+      const faceRulesBlock = faceRules
+        ? `Face-shape-specific guidance for ${portrait.faceShape.value} (apply to every tile):
+- Best frame shapes overall: ${faceRules.bestFrameShapes.join(" / ")}
+- Material guidance: ${faceRules.materialGuidance.join(" / ")}
+- Bridge style guidance: ${faceRules.bridgeStyleGuidance.join(" / ")}
+- Brow line guidance: ${faceRules.browLineGuidance.join(" / ")}
+- Color/contrast guidance: ${faceRules.colorContrastGuidance.join(" / ")}
+- Frame width guidance: ${faceRules.frameWidthGuidance.join(" / ")}
+- Lens height guidance: ${faceRules.lensHeightGuidance.join(" / ")}`
+        : "";
+
+      const universalRulesBlock = `Universal eyewear rules (apply to every tile, regardless of face shape):
+${EYEWEAR_RULES.universalRules.map((r) => `- ${r}`).join("\n")}`;
+
+      const planNote = `Planner: ${candidateCount} catalog entries passed the deterministic filter (face shape ${portrait.faceShape.value} ∩ presentation ${portrait.presentation.value} ∩ user hard avoids). Top ${flattering.length} selected by score (style preference + color-tone harmony with ${portrait.undertone.value} undertone + face-shape versatility); ${useCarefully ? 1 : 0} use-carefully educational example added.`;
+
+      return compose([
         imageRoles(null),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic eyeglasses frame recommendation board, using the user's portrait(s) for identity and the written layout instructions for structure.",
+        IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 photorealistic Eyeglasses / Frames Guide. Identity-required mode: render the SAME person from Image 1 in ${N} frame try-on tiles. ${flattering.length} are strong matches; ${useCarefully ? 1 : 0} is an educational "use carefully" example for contrast.`,
+        lockedFragment,
+        `Per-frame canonical details (do not modify):
+
+${frameDetails}`,
+        universalRulesBlock,
+        faceRulesBlock,
         `Use these analysis values exactly. Do not re-derive them:
 - Face shape: ${portrait.faceShape.value}
-- Contrast: ${portrait.contrast.value}
+- Hair color (preserve in render): ${portrait.hairColor}
+- Eye color (preserve in render): ${portrait.eyeColor}
+- Visible presentation: ${portrait.presentation.value}
+- Facial hair (preserve exactly): ${portrait.facialHair.value}
 - Undertone: ${portrait.undertone.displayLabel}`,
+        planNote,
         `LAYOUT (build from these instructions, no layout reference image):
-- Top band (small): optional small-caps eyebrow line, no large heading needed.
-- Main grid: 8 photorealistic portrait tiles in a 4-column by 2-row arrangement. Each tile shows the SAME person from Image 1, head-and-shoulders, wearing different eyeglasses. Plain neutral background, soft warm lighting, neutral expression. Only the frames change between tiles.
-- Tile composition: pick 8 distinct frame archetypes that span shape, thickness, material, and color. Cover all of: round / circular, aviator, cat-eye, rectangular minimal, oversized square, clear or transparent acetate, wire or rimless, and one bold-colored acetate. Choose specific styles within those archetypes that work well for ${portrait.faceShape.value} where possible.
-- Below each tile, on the cream background:
-  - Line 1: frame name in 2-5 words (compose dynamically; do NOT copy from the layout reference)
-  - Line 2: "Best for: [face shapes]" line in 11px sans-serif. List 2-4 face shapes this frame archetype flatters. If ${portrait.faceShape.value} is among them, the frame is a strong option for this user; otherwise it's a use-carefully pick.
-  - Line 3: a small badge row:
-    - For exactly ONE tile (the best overall match for ${portrait.faceShape.value}, ${portrait.contrast.value} contrast, and ${portrait.undertone.displayLabel}): a small gold star icon + "Your best match" in small caps
-    - For tiles whose "Best for" list includes ${portrait.faceShape.value}: a small green check icon + "Strong option" in small caps
-    - For tiles whose "Best for" list does NOT include ${portrait.faceShape.value}: a small grey "skip" dot + "Use Carefully" in small caps
-- Frame colors should harmonize with ${portrait.undertone.displayLabel} where the frame is colored (warm tortoise for warm undertones, cool grey/black for cool undertones, etc.).`,
-        `IDENTITY ANCHOR (hard requirement across all 8 tiles):
-- Same person in every tile, drawn from Image 1 (and additional portrait angles if provided). Same eyes, brows, nose, mouth, skin tone, ethnic features, age.
-- Same head-and-shoulders crop, same camera angle, same neutral expression.
-- Same neutral top, same plain cream background, same soft warm lighting across all 8 tiles.
-- Eye visibility: the eyes are clearly visible behind the frames in every tile (no opaque lenses, no extreme tint).
-- The only variable across the 8 tiles is the eyeglasses frame.`,
+- Top band (~7% canvas height): small-caps eyebrow "FRAMES GUIDE", thin horizontal divider below, monospace small-caps chip "${portrait.faceShape.value.toUpperCase()}" right-aligned next to the eyebrow.
+- Main region: ${N} photorealistic head-and-shoulders portrait tiles in a 3-column × 2-row grid. Each tile shows the SAME person from Image 1, neutral cream background, soft warm studio lighting, neutral expression. Only the frames change between tiles.
+- Tile order matches the per-frame details list above (top-left to bottom-right).
+- Below each tile, on a thin label band:
+  - Frame name in bold small-caps, matching the canonical name exactly.
+  - Tiny secondary line in regular type: shape category + material (e.g. "Wayfarer · Acetate").
+  - One short reason line (under 12 words) explaining the match — for the use-carefully tile, this is the reason it's flagged.
+  - For the use-carefully tile (the last tile, position ${N}): a small monospace badge "USE CAREFULLY" in tiny mono caps to the right of the frame name. The badge color is warm gray, not red — this is educational, not a warning.
+- Bottom band (~6%): single italic concluding line: "Frames balance face shape, hair color, and intended impression — fit-test in person before committing."`,
+        tileAnchor(
+          "frames (face is identical across tiles; only the eyeglasses change; lens transparency is identical)"
+        ),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Frame names 2 to 5 words; "Best for" lines under 12 words; badge labels exactly as specified above.
-- Never use "Avoid", "Bad", "Ugly", or red Xs. Use "Use Carefully" or "Skip" with a grey dot.
-- Exactly ONE tile is marked "Your best match" with a gold star.
-- Do NOT copy frame names or "Best for" lists from the layout reference. Compose all of it for this user.
-- Preserve eye visibility, facial identity, and skin texture.
+- Identity-required mode: render the SAME person from Image 1 in every tile. Same crop, same camera angle, same lighting, same neutral expression.
+- The ${N} frames must match the listed canonical names exactly; do not invent variations, swap shapes, or substitute materials/colors/thicknesses.
+- EYES MUST BE VISIBLE in every tile. No opaque lenses, no extreme tint, no dark sunglasses, no thick glossy frames covering the eye line.
+- Brow line: top of frames sits at or just below the natural brow (cat-eye and browline categories are the intentional exceptions and rise above the brow).
+- Frame colors must match the canonical color tone described for each frame (e.g. "warm tortoise" stays warm tortoise; "jet black" stays jet black). Do not improvise.
+- Preserve facial hair exactly as analyzed (${portrait.facialHair.value}). Every tile shows the same facial-hair level.
+- The "USE CAREFULLY" tile renders with the same identity-preserve quality as flattering tiles; it is labeled with the badge but otherwise rendered cleanly.
+- The "USE CAREFULLY" badge MUST NOT use red, "Avoid", "Bad", "Wrong", or "Skip" wording — use neutral warm-gray "USE CAREFULLY" only.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Same person across all 8 tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features.",
-          "Identical head-and-shoulders crop, neutral expression, plain background, soft warm lighting.",
-          "Eyes are clearly visible in every tile.",
-          `Exactly ONE tile is marked "Your best match" — choose the frame archetype that best flatters ${portrait.faceShape.value} face shape and ${portrait.contrast.value} contrast.`,
-          "Frame archetypes covered: round, aviator, cat-eye, rectangular minimal, oversized square, clear acetate, wire/rimless, bold colored acetate."
+          `Same person across all ${N} tiles. Same eyes, brows, nose, mouth, skin tone, ethnic features, age.`,
+          "Identical head-and-shoulders crop, same camera angle, same neutral expression in every tile.",
+          "Eyes are clearly visible in every tile — frames do not cover the eye line.",
+          `${flattering.length} flattering tile${flattering.length === 1 ? "" : "s"} + ${useCarefully ? 1 : 0} use-carefully tile = ${N} total. No more, no fewer.`,
+          `Hair color preserved exactly: ${portrait.hairColor}.`,
+          `Facial hair preserved exactly: ${portrait.facialHair.value}.`,
+          "Frame names and color tones match the canonical entries; no substitutions."
         ])
-      ])
+      ]);
+    }
   },
   {
-    title: "Body Shape Guide",
-    description: "Body shape, best features, and four flattering silhouette examples.",
+    // === STEP: Silhouette Balance Guide ===
+    title: "Silhouette Balance Guide",
+    description: "Body shape identified, paired with canonical balancing principles for waist, vertical line, rises, hemlines, necklines, sleeves, layering, and fabric.",
     reference: "body",
     requires: { portrait: true, body: true },
     buildPrompt: ({ portrait, body }) => {
       if (!body) {
-        return "Body analysis missing. Cannot generate Body Shape Guide.";
+        return "Body analysis missing. Cannot generate Silhouette Balance Guide.";
       }
-      const hedged = body.bodyShape.confidence === "high"
-        ? body.bodyShape.value
-        : `${body.bodyShape.value} (most likely)`;
+      const hedged =
+        body.bodyShape.confidence === "high"
+          ? body.bodyShape.value
+          : `${body.bodyShape.value} (most likely)`;
+
+      const canonical = body.canonicalSilhouette;
+      const principleCards = canonical
+        ? `Render exactly these 5 principle cards in the right panel. Use the canonical content provided; paraphrasing for legibility is fine, but do not invent new principles or merge cards.
+
+CARD 1 — WAIST & VERTICAL LINE
+- Waist Strategy: ${canonical.waistStrategy.join(" / ")}
+- Vertical Line: ${canonical.verticalLine.join(" / ")}
+
+CARD 2 — RISES & HEMLINES
+- Best Rises: ${canonical.bestRises.join(" / ")}
+- Best Hemlines: ${canonical.bestHemlines.join(" / ")}
+
+CARD 3 — NECKLINES & SLEEVES
+- Necklines: ${canonical.necklines.join(" / ")}
+- Sleeves: ${canonical.sleeves.join(" / ")}
+
+CARD 4 — LAYERING & FABRIC
+- Layering: ${canonical.layeringRules.join(" / ")}
+- Fabric & Structure: ${canonical.fabricAndStructure.join(" / ")}
+
+CARD 5 — USE CAREFULLY
+- ${canonical.useCarefully.join(" / ")}
+
+Do not add a 6th card. Do not omit a card. Render only the canonical content above.`
+        : `Canonical silhouette principles unavailable for "${body.bodyShape.value}". Fall back to per-photo observations:
+- Shoulder/hip balance: ${body.shoulderHipBalance}
+- Waist: ${body.waistDefinition}
+- Torso/leg balance: ${body.torsoLegBalance}
+- Silhouette rules: ${body.silhouetteRules.join(" / ")}`;
+
+      const diagnosticBlock = canonical
+        ? `Why this shape (canonical diagnostic cues for ${canonical.name}):
+- ${canonical.diagnosticCues.join("\n- ")}`
+        : "";
 
       return compose([
         imageRoles(null, {
@@ -641,51 +1354,112 @@ ${verdictLines}`,
             "do NOT copy the body, outfit, pose, measurements, or person from the layout reference"
         }),
         personLock(portrait),
-        "Generate a 1024x1536 body shape guide using the written layout instructions for structure. Image 1 is the user's face identity reference; the final user image is the full-body standing photo for body proportions.",
+        BODY_AWARE_IDENTITY_PRESERVE_FRAGMENT,
+        "Generate a 1024x1536 Silhouette Balance Guide. The page identifies the user's body shape and leads with canonical balancing principles. Image 1 is the user's face identity reference; the final user image is the full-body standing photo for body proportions. The body shape name appears as a tag — the principles do the visible work.",
         `Use these analysis values exactly. Do not re-derive them:
 - Body shape: ${hedged}
-- Shoulder/hip balance: ${body.shoulderHipBalance}
-- Waist: ${body.waistDefinition}
-- Torso/leg balance: ${body.torsoLegBalance}
-- Best features: ${body.bestFeatures.join(", ")}
-- Silhouette rules: ${body.silhouetteRules.join(", ")}`,
+- Shoulder/hip balance (per-photo observation): ${body.shoulderHipBalance}
+- Waist (per-photo observation): ${body.waistDefinition}
+- Torso/leg balance (per-photo observation): ${body.torsoLegBalance}
+- Best features (per-photo observation): ${body.bestFeatures.join(", ")}`,
+        diagnosticBlock,
+        principleCards,
         `LAYOUT (build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "BODY SHAPE GUIDE" + a thin divider.
-- Left region (about 35% width): a full-body photorealistic render using the user's face identity from Image 1 and body proportions from the full-body photo, standing, plain neutral background. Below the figure, a small text block with:
-  - "Body Shape: ${body.bodyShape.value}"
-  - "Best Features: ${body.bestFeatures.slice(0, 3).join(", ")}"
-  - A small monoline body-silhouette diagram icon shaped to suggest a ${body.bodyShape.value} silhouette.
-- Right region (about 65% width): 4 flattering silhouette examples in a horizontal row. Each example is a stylized full-body fashion figure (line-art or simple flat illustration, not a photo) wearing an outfit that follows the silhouette rules above for ${body.bodyShape.value}. Derive the garment categories from the user's visible presentation and uploaded references. Do not default to dresses, skirts, suits, heels, or any fixed gendered archetype unless the uploaded references support that direction.
-- Bottom band (about 12% canvas height): a horizontal row of 4 small green-check icons + 1-line principles each, derived from the silhouette rules above. Compose each principle dynamically (examples of shape: "Define waist", "Fitted top", "Flared or straight bottom", "Balanced proportions"). Keep each under 6 words.`,
+- Top band (~8% canvas height): small-caps eyebrow "SILHOUETTE BALANCE GUIDE", thin horizontal divider below.
+- Tag row (~4% canvas height): a single small chip in small-caps showing "${body.bodyShape.value.toUpperCase()}" — this is the shape tag, not the headline.
+- Main region: split horizontal:
+  - LEFT (~45% width): a full-body photorealistic render using the user's face identity from Image 1 and body proportions from the full-body photo, standing, neutral cream background, soft warm studio light. Overlay two thin guide lines on top of the figure: a vertical centerline from crown to feet, and a horizontal line at the natural waist. Both lines are subtle (low-opacity warm gray, 1px), labeled in tiny small-caps ("VERTICAL LINE" / "WAIST").
+  - RIGHT (~55% width): 5 stacked principle cards as specified above. Each card is a soft-shadow rounded card on slightly lighter cream. Card heading in small-caps. Card body uses bullet lines (one bullet per principle group). Card height is roughly equal across the 5; truncate gracefully if content is dense.
+- Bottom band (~10% canvas height): a thin row with two parts:
+  - LEFT half: small-caps "PER-PHOTO OBSERVATIONS" — three short lines from shoulderHipBalance, waist, torso/leg balance.
+  - RIGHT half: small-caps "COMMON MISIDENTIFICATIONS" — one line summarizing the canonical commonMisidentifications field${canonical && canonical.commonMisidentifications.length > 0 ? ` (canonical content: "${canonical.commonMisidentifications[0].slice(0, 200)}")` : ""}.`,
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Supportive language only. No weight claims, no body criticism, no numeric body measurements.
-- Body silhouette badge text must read exactly: "${body.bodyShape.value}".
-- Right-region silhouette examples are stylized illustrations, not photos.
-- Do NOT copy text content (body shape label, principles, best features) from the layout reference. Compose all of it for this user.
+- Supportive, balance-focused language only. NO weight claims, NO body criticism, NO numeric body measurements, NO "flaws" wording.
+- Body shape chip text must read exactly: "${body.bodyShape.value.toUpperCase()}".
+- The 5 principle cards must follow the canonical content above; do not invent or paraphrase liberally.
+- The full-body figure preserves the user's identity (face from Image 1) and body proportions (from full-body photo) exactly. Do not slim, widen, lengthen, shorten, or glamorize.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          `Body shape printed in the left region is exactly: ${body.bodyShape.value}.`,
-          "Left-region figure preserves face identity from Image 1 and body proportions from the full-body photo.",
-          "All silhouette examples follow the silhouette rules listed above.",
-          "Bottom-band principles are 4 short lines composed from the silhouette rules; under 6 words each."
+          `Body shape chip is exactly: ${body.bodyShape.value.toUpperCase()}.`,
+          "Left-region figure preserves face identity from Image 1 and body proportions from the full-body photo without exaggeration.",
+          "Right-region renders exactly 5 principle cards with the canonical content; no extras, no omissions.",
+          "Vertical and waist guide lines are thin and subtle; they do not dominate the figure.",
+          "No weight, size, or numeric body language anywhere on the page."
         ])
       ]);
     }
   },
   {
+    // === STEP: Outfit Style Guide ===
     title: "Outfit Style Guide",
-    description: "Five full-body outfits tailored to the body shape and seasonal palette.",
+    description: "Three identity-preserved full-body outfits (work / casual / event) grounded in canonical silhouette principles and the user's locked palette.",
     reference: "body",
     requires: { portrait: true, body: true },
-    buildPrompt: ({ portrait, body }) => {
+    buildPrompt: ({ portrait, body, session }) => {
       if (!body) {
         return "Body analysis missing. Cannot generate Outfit Style Guide.";
       }
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
       const outfitGuidance = outfitPresentationGuidance(portrait);
+      const canonical = body.canonicalSilhouette;
+      const locked = portrait.paletteHypotheses[0];
+
+      const FULL_OCCASION_ORDER: OccasionId[] = ["work", "casual", "event"];
+      // Subset by SessionContext.occasions if the user picked a subset for this run.
+      const requestedOccasions =
+        session?.occasions && session.occasions.length > 0
+          ? FULL_OCCASION_ORDER.filter((id) => session.occasions!.includes(id))
+          : FULL_OCCASION_ORDER;
+      const occasionOrder = requestedOccasions.length > 0 ? requestedOccasions : FULL_OCCASION_ORDER;
+      const occasionData = occasionOrder.map((id) => OUTFIT_RULES.occasions[id]);
+      const N = occasionData.length;
+      const orderHumanList = occasionData.map((o) => o.name).join(" / ");
+
+      const occasionDecisions = occasionData.map((o) => ({
+        label: o.name,
+        details: `${o.compositionTarget} — ${o.goal}`
+      }));
+
+      const lockedFragment = renderLockedDecisions({
+        itemNounPlural: "outfits",
+        decisions: occasionDecisions,
+        doNotInventClause: `Render exactly these ${N} outfit column${N === 1 ? "" : "s"}, in the order ${orderHumanList}. Each column follows its canonical occasion rules below; do not collapse, merge, or add ${N === 1 ? "a second" : "extra"} outfit${N === 1 ? "" : "s"}.`
+      });
+
+      const sessionNoteBlock =
+        session?.freeTextNote && session.freeTextNote.trim().length > 0
+          ? `Occasion context (this run, from the user): "${session.freeTextNote.trim()}". Treat this as soft guidance — let it nudge fabric weight, formality, color choice, or layering within the canonical rules; do not invent garments unrelated to the occasion's canonical example shapes.`
+          : null;
+
+      const occasionRulesBlock = `Per-occasion canonical rules (apply each occasion's rules to its own column; do not invent):
+
+${occasionData
+  .map(
+    (o) => `${o.name} (id: ${o.id}):
+- Composition target: ${o.compositionTarget}
+- Goal: ${o.goal}
+- Palette approach: ${o.paletteApproach.join(" / ")}
+- Occasion-specific silhouette principles (layered on top of body-shape principles): ${o.silhouettePrinciples.join(" / ")}
+- Layering strategy: ${o.layeringStrategy.join(" / ")}
+- Fabric guidance: ${o.fabricGuidance.join(" / ")}
+- Example outfit shapes (palette-agnostic; just garment categories): ${o.exampleOutfitShapes.slice(0, 3).join(" | ")}
+- Use carefully: ${o.useCarefully.join(" / ")}`
+  )
+  .join("\n\n")}`;
+
+      const silhouetteGuidance = canonical
+        ? `Body-shape silhouette guidance (apply consistently across all 3 outfits; this is the canonical principle set for ${canonical.name}; combine with each occasion's rules above):
+- Waist strategy: ${canonical.waistStrategy.join(" / ")}
+- Best rises: ${canonical.bestRises.join(" / ")}
+- Best hemlines: ${canonical.bestHemlines.join(" / ")}
+- Necklines that work: ${canonical.necklines.join(" / ")}
+- Sleeves that work: ${canonical.sleeves.join(" / ")}
+- Layering rules: ${canonical.layeringRules.join(" / ")}
+- Fabric and structure: ${canonical.fabricAndStructure.join(" / ")}
+- Use carefully: ${canonical.useCarefully.join(" / ")}`
+        : `Canonical silhouette principles unavailable. Fall back to model-emitted silhouette rules for ${body.bodyShape.value}:
+- ${body.silhouetteRules.join("\n- ")}`;
 
       return compose([
         imageRoles(null, {
@@ -698,142 +1472,65 @@ ${verdictLines}`,
             "do NOT copy the body, outfit, pose, measurements, or person from the layout reference"
         }),
         personLock(portrait),
-        "Generate a 1024x1536 photorealistic identity-preserving Outfit Style Guide. Show the same real person from the uploaded portrait wearing five different outfits. Prioritize face identity and body proportion preservation over fashion-illustration polish.",
+        BODY_AWARE_IDENTITY_PRESERVE_FRAGMENT,
+        `Generate a 1024x1536 photorealistic identity-preserving Outfit Style Guide. The board shows the same real person from the uploaded references wearing ${N} different outfit${N === 1 ? "" : "s"} across ${N === 1 ? "one occasion" : `${N} occasions`}: ${orderHumanList}. Identity preservation and body-scale preservation are the primary rules; this is not a fashion-illustration page.`,
+        lockedFragment,
         `Use these analysis values exactly. Do not re-derive them:
 - Body shape: ${body.bodyShape.value}
-- Silhouette rules: ${body.silhouetteRules.join(", ")}
-- Season: ${portrait.colorSeason.value}
-- Best metal (for jewelry/hardware): ${portrait.bestMetal.value}`,
-        `Approved outfit colors. Every garment color must match one of these exact hex values:
-- Best neutrals: ${swatchList(portrait.palette.bestNeutrals)}
-- Signature colors: ${swatchList(portrait.palette.signatureColors)}
-- Accent colors (use sparingly): ${swatchList(portrait.palette.accentColors)}
-- Avoid (do NOT use): ${swatchList(portrait.palette.avoid)}`,
+- Locked palette direction: ${locked.name} (id: ${locked.id})
+- Best metal (for jewelry/hardware): ${portrait.bestMetal.value}
+- Visible presentation: ${portrait.presentation.value}`,
+        `Approved outfit colors (canonical hex from the locked palette; render exactly these values):
+- Best neutrals: ${swatchList(locked.palette.bestNeutrals)}
+- Signature colors: ${swatchList(locked.palette.signatureColors)}
+- Accent colors (use sparingly): ${swatchList(locked.palette.accentColors)}
+- Use carefully (conditional, not for primary garments): ${swatchList(locked.palette.useCarefully)}`,
         outfitGuidance,
+        occasionRulesBlock,
+        silhouetteGuidance,
+        sessionNoteBlock,
         `LAYOUT (identity-preserving mode, build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "OUTFIT STYLE" + title "Identity-Preserving Outfit Guide" + a thin divider below.
-- Main region: 5 photorealistic full-body outfit portraits arranged in a single horizontal row of 5 columns. Each column shows the SAME person from Image 1, using body proportions from the full-body photo. The person has the same face, hair, skin tone, facial features, visible presentation, and natural body scale in every column. Only the outfit changes.
-- Use the final user image only for body proportions and stance reference. Do not widen, slim, lengthen, shorten, or glamorize the body. Do not change the person's apparent weight.
-- Outfit variety across the 5 columns, all derived from uploaded references, ${portrait.presentation.value} visible presentation, and silhouette rules: one casual everyday, one polished workwear, one elevated occasion look, one smart-casual layered look, and one weekend or evening look. Compose specific garments dynamically. Do NOT default to fixed fashion archetypes.
-- Every garment color must use an exact hex from the approved swatches. Hardware (belts, buckles, jewelry) is rendered in ${portrait.bestMetal.value}.
-- Below each column: a short outfit label in 1-3 words and one tiny color dot matching a key garment color.
-- Bottom band: a horizontal "Key:" line with 5 short principles in 11px sans-serif, separated by small bullet dots. One principle per outfit, composed dynamically from the silhouette rules and season. Keep each under 5 words (examples of shape: "Defined waist", "Clean structure", "Rich colors", "Balanced proportions", "Best metal").`,
+- Top band (~7% canvas height): small-caps eyebrow "OUTFIT STYLE GUIDE", thin horizontal divider below.
+- Main region: ${N} photorealistic full-body outfit portrait${N === 1 ? "" : "s"} arranged in a single horizontal row of ${N} column${N === 1 ? "" : "s"}, top-to-bottom matching the occasion order (${orderHumanList}). Each column shows the SAME person from Image 1, using body proportions from the full-body photo. The person has the same face, hair, skin tone, facial features, visible presentation, hair color, hair length, and natural body scale in every column. Only the outfit and the implied pose context change.
+- Use the final user image only for body proportions and stance reference. Do not widen, slim, lengthen, shorten, or glamorize the body.
+- Each outfit column should be composed from BOTH the body-shape silhouette guidance AND the occasion-specific rules above. Each column draws ONLY from its own occasion's palette approach, layering strategy, and example shapes. No single occasion's rules cross into another column.
+- Below each column, on a thin label band:
+  - Occasion in bold small-caps (${occasionData.map((o) => `"${o.id.toUpperCase()}"`).join(" / ")}).
+  - Tiny secondary line in regular type: the occasion's composition target (e.g. "1 top + 1 bottom + 1 structured layer + 1 polished shoes + 2-3 accessories" for Work).
+  - One short rationale line (under 16 words) referencing one occasion-specific principle AND one body-shape silhouette principle the outfit honors, plus a palette swatch reference. Compose fresh per column.
+- Bottom band (~9% canvas height): "WHY THIS WORKS" small-caps heading, then one canonical "Example outfit shape" per occasion (drawn from the canonical lists above) rendered as a single line in regular type with the occasion as a small chip prefix.`,
+        tileAnchor("outfit (face, hair, body proportions, and scale identical across columns; only the outfit changes)"),
         STYLE_BLOCK,
         `Hard rules:
 - All text must be legible English. No gibberish, no warped letters.
-- Identity preservation is mandatory: same face, same hair, same skin tone, same age, same visible presentation, same body proportions across all 5 outfit portraits.
-- Do not exaggerate body size, weight, width, height, waist, chest, hips, or legs. No weight claims or body criticism.
-- Do not make the person look like a generic model, influencer, celebrity, mannequin, or reference-image subject.
-- Every garment color uses an exact hex from the approved swatches above. Never use an Avoid color.
-- Hardware is consistently in ${portrait.bestMetal.value}.
+- Identity preservation is mandatory: same face, same hair, same skin tone, same age, same visible presentation across all ${N} outfit portrait${N === 1 ? "" : "s"}.
+- DO NOT CHANGE BODY SCALE: do not slim, widen, lengthen, shorten, or glamorize the user's body in any column. Body proportions are the user's, not a fashion-model archetype.
+- No weight claims, body criticism, or numeric body language anywhere on the page.
+- Every garment color uses an exact hex from the approved swatches above. Never use a "use carefully" color from the locked palette.
+- Hardware (belts, buckles, jewelry) consistently in ${portrait.bestMetal.value}.
 - No brand names, no prices, no fake product codes.
-- Compose outfits from the user's visible presentation, uploaded references, body analysis, and color analysis. Do not default to dresses, suits, skirts, heels, or any fixed fashion archetype.
+- Compose outfits from the user's visible presentation, body shape, the canonical silhouette guidance, AND the occasion-specific canonical rules above. Each occasion gets its OWN column; rules from one occasion must not bleed into another.
+- "Use carefully" entries from each occasion's canonical rules must NOT appear in that occasion's column unless paired with intentional context.
+- Do not default to dresses, suits, skirts, heels, or any fixed fashion archetype unless the user's presentation and body shape clearly support it.
+- Render exactly ${N} outfit column${N === 1 ? "" : "s"} (${orderHumanList}). Do not add any unrequested occasion.
 - Do not mention that this is AI-generated.`,
         preserveRepeat([
-          "Five full-body outfit portraits in a single row.",
-          "Same person in every outfit portrait: face from Image 1, body proportions from the full-body photo.",
+          `${N} full-body outfit portrait${N === 1 ? "" : "s"} in a single row, matching ${orderHumanList} order exactly.`,
+          "Same person in every outfit portrait: face from Image 1, body proportions from the full-body photo, identical scale.",
           "Do not alter or exaggerate the user's body size or shape.",
-          "Every garment color matches one of the approved hex values; no Avoid colors anywhere.",
-          "Hardware across the entire image is rendered in " + portrait.bestMetal.value + ".",
-          "Bottom key line has exactly 5 principles, one per outfit, under 5 words each."
+          "Every garment color matches one of the approved hex values; no use-carefully colors.",
+          `Hardware across the entire image is rendered in ${portrait.bestMetal.value}.`,
+          "Each per-column rationale references at least one occasion-specific principle (palette / silhouette / layering / fabric) AND one body-shape silhouette principle from the guidance above.",
+          "Bottom 'Why this works' band lists exactly one canonical 'Example outfit shape' per occasion, drawn from the canonical lists, with the occasion as a small chip prefix."
         ])
       ]);
     }
   },
-  {
-    title: "Makeup Feature Guide",
-    description: "Four feature close-ups (brow, eye, blush, lip) with shade swatches and recommendations.",
-    reference: "portrait",
-    requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
-
-      return compose([
-        imageRoles(null),
-        personLock(portrait),
-        portrait.presentation.value === "Masculine"
-          ? "Generate a 1024x1536 GROOMING FEATURE GUIDE using the written layout instructions for the 4-column close-up structure. The four feature panels for a masculine-presenting user are: BROW (shaping + tone), BEARD/STUBBLE (if facial hair present, otherwise SKIN — care notes and complexion tone), LIP BALM (tinted balm tones, no full lipstick), and HAIR (texture and styling cues). Image 1 is the user's portrait; preserve facial hair exactly. Do NOT render eyeshadow, blush, full lipstick, or any glam makeup."
-          : "Generate a 1024x1536 makeup feature guide using the written layout instructions for the 4-column close-up structure. Image 1 is the user's portrait; use it as the identity reference for the close-up crops.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Depth: ${portrait.depth.value}
-- Undertone: ${portrait.undertone.displayLabel}
-- Hair color: ${portrait.hairColor}
-- Eye color: ${portrait.eyeColor}`,
-        `Reference palette colors. Use these to inform shade picks where they harmonize:
-- Signature colors: ${swatchList(portrait.palette.signatureColors)}
-- Accent colors: ${swatchList(portrait.palette.accentColors)}`,
-        `LAYOUT (build from these instructions, no layout reference image):
-- Top band: small-caps eyebrow "MAKEUP GUIDE" centered, with a thin divider below.
-- Main region: 4 feature panels arranged in a single horizontal row of 4 columns. The columns left to right: BROW, EYE, BLUSH, LIP.
-- Each panel renders, top to bottom:
-  1. A photorealistic close-up crop of that feature on the user (eyebrow region for BROW; eye + lash + lid for EYE; cheek/cheekbone area for BLUSH; closed-mouth lip area for LIP). Identity preserved from Image 1; soft warm lighting.
-  2. Column header in small-caps tracked: "BROW" / "EYE" / "BLUSH" / "LIP".
-  3. A row of 3 small color swatches centered, sized about 28px each. Each swatch's color is composed dynamically for that feature on this user, harmonizing with ${portrait.undertone.displayLabel} and pulling from the Signature/Accent palette where natural.
-  4. Two short 1-2 word shade recommendation lines beneath the swatches, e.g. "Soft Brown / Warm Brown" for BROW, "Apricot Brown / Golden Brown" for EYE. Compose all 8 lines dynamically (2 per feature).
-- Bottom band (about 12% canvas height): a single 1-line tip in serif italic centered, that ties the four features together for this user, grounded in ${portrait.depth.value} depth and ${portrait.undertone.displayLabel} undertone. Example shape (do not copy): "Glowy skin, warm tones, and fresh finishes enhance your natural radiance."`,
-        STYLE_BLOCK,
-        `Hard rules:
-- All text must be legible English. No gibberish, no warped letters.
-- Close-up crops preserve the user's facial features from Image 1; do not over-retouch.
-- All shade names are 1-2 words; the bottom tip is 1 line under 14 words.
-- No brand names, no procedures, no medical or skin-treatment claims.
-- Do NOT copy shade names or the bottom tip from the layout reference. Compose them for this user.
-- Do not mention that this is AI-generated.`,
-        preserveRepeat([
-          "Four columns: BROW / EYE / BLUSH / LIP, in that order, left to right.",
-          "Each column has exactly 3 small swatches and 2 shade recommendation lines.",
-          "Close-ups preserve the user's identity and skin texture from Image 1.",
-          "Shade colors harmonize with " + portrait.undertone.displayLabel + " undertone."
-        ])
-      ]);
-    }
-  },
-  {
-    title: "Use Carefully Guide",
-    description: "Six categories of colors and finishes to use carefully, with kind replacements.",
-    reference: "portrait",
-    requires: { portrait: true },
-    buildPrompt: ({ portrait }) => {
-      const swatchList = (list: Swatch[]) =>
-        list.map((s) => `${s.name} ${s.hex}`).join(", ");
-
-      return compose([
-        imageRoles("Use Carefully Guide"),
-        personLock(portrait),
-        "Generate a 1024x1536 \"Use Carefully\" style guide using the LAYOUT REFERENCE for the 6-section row structure.",
-        `Use these analysis values exactly. Do not re-derive them:
-- Depth: ${portrait.depth.value}
-- Contrast: ${portrait.contrast.value}
-- Undertone: ${portrait.undertone.displayLabel}
-- Season: ${portrait.colorSeason.value}`,
-        `Reference palette colors:
-- Use Carefully (the user's avoid swatches, use these for the section examples): ${swatchList(portrait.palette.avoid)}
-- Signature colors (use for replacement suggestions): ${swatchList(portrait.palette.signatureColors)}
-- Accent colors (use for replacement suggestions): ${swatchList(portrait.palette.accentColors)}`,
-        `LAYOUT (follow the LAYOUT REFERENCE):
-- Top band: bold serif heading "USE CAREFULLY" centered, with a small italic subtitle below: "Colors and finishes to ease away from your face".
-- Main region: 6 vertical sections arranged in a single horizontal row of 6 columns. Sections left to right: "Too Dark", "Too Cool", "Muted / Dusty", "Neon", "Overly Sharp", "Overly Glossy".
-- Each section renders, top to bottom:
-  1. Section title in small-caps tracked.
-  2. Two adjacent square swatches (about 60x60 px each), side by side. For sections 1-4 (Too Dark, Too Cool, Muted/Dusty, Neon) use 2 colors from the user's Avoid swatches above that fit the section's category, OR if no exact match, render representative example colors. For sections 5-6 (Overly Sharp, Overly Glossy) render textural/material examples (a hard high-contrast B/W swatch for Sharp, a glossy mirror-finish swatch for Glossy).
-  3. A 1-line replacement suggestion in 11px sans-serif, naming a Signature or Accent color from the user's palette that does the same job better. Example shape: "Try ${portrait.palette.signatureColors[0]?.name || "a signature warm"} instead."
-- Bottom band (about 12% canvas height): a single concluding line in serif italic centered, written for this user and grounded in their depth + undertone. Example shape (do not copy): "Use colors and finishes carefully when they feel too heavy, cool-toned, or overpowering near your face."`,
-        STYLE_BLOCK,
-        `Hard rules:
-- All text must be legible English. No gibberish, no warped letters.
-- Section titles match exactly: "Too Dark", "Too Cool", "Muted / Dusty", "Neon", "Overly Sharp", "Overly Glossy".
-- Use "Use Carefully" framing, never "Avoid", "Bad", or "Ugly" inside the visible report. Section titles and replacements must stay neutral.
-- All replacement suggestions name colors from the user's Signature or Accent palette above.
-- Do NOT copy section explanations or the bottom line from the layout reference. Compose them for this user.
-- Do not mention that this is AI-generated.`,
-        preserveRepeat([
-          "Six section columns in this exact left-to-right order: Too Dark, Too Cool, Muted / Dusty, Neon, Overly Sharp, Overly Glossy.",
-          "Each section has exactly 2 swatches and 1 replacement suggestion line.",
-          "Replacement suggestions reference colors from the user's Signature or Accent palette.",
-          "Bottom line is composed for this user, grounded in " + portrait.depth.value + " depth and " + portrait.undertone.displayLabel + " undertone."
-        ])
-      ]);
-    }
-  }
+  // "Makeup Feature Guide" was retired here — replaced by the Makeup Shade Guide
+  // rewrite, which presentation-gates to 7 makeup sections or 5 grooming sections
+  // and pulls all guidance from canonical MAKEUP_RULES data.
+  // "Use Carefully Guide" was retired here — its content has been folded into the
+  // Palette Direction Report's "USE CAREFULLY (CONDITIONAL)" section, which renders
+  // canonical use-carefully swatches with conditional language and replacement
+  // guidance. Keeping a separate hidden step adds no value.
 ];

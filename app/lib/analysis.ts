@@ -1,5 +1,14 @@
+import type { ImageQualityRawSignals, ImageQualitySignals } from "./imageQuality";
+import { computeConfidencePenalty } from "./imageQuality";
+import type { PaletteHypothesis } from "./paletteTypes";
+import type { SilhouetteShape, SilhouetteShapeId } from "./silhouetteTypes";
+import type { FaceShapeId, FaceShapePrinciples } from "./faceShapeTypes";
+import { getSeason, resolveSeasonId } from "../data/colorSystem";
+import { SILHOUETTE_RULES } from "../data/silhouetteRules";
+import { FACE_SHAPE_RULES } from "../data/faceShapeRules";
+
 export const ANALYSIS_MODEL = "gpt-5.5";
-export const ANALYSIS_SCHEMA_VERSION = 2;
+export const ANALYSIS_SCHEMA_VERSION = 7;
 
 const RESPONSES_URL = "https://api.openai.com/v1/responses";
 
@@ -11,7 +20,7 @@ export type Verdict<T extends string> = {
   notes?: string;
 };
 
-export type Swatch = { name: string; hex: string };
+export type Swatch = { name: string; hex: string; note?: string };
 
 export type Depth = "Light" | "Light-Medium" | "Medium" | "Medium-Deep" | "Deep";
 export type Contrast = "Low" | "Low-Medium" | "Medium" | "Medium-High" | "High";
@@ -55,22 +64,25 @@ export type HairLength =
 export type HairTexture = "Straight" | "Wavy" | "Curly" | "Coily";
 
 const HEX_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/;
-const PALETTE_REQUIREMENTS = {
-  bestNeutrals: { min: 6, max: 7 },
-  signatureColors: { min: 6, max: 8 },
-  accentColors: { min: 4, max: 5 },
-  avoid: { min: 5, max: 6 }
+const HYPOTHESIS_PALETTE_REQUIREMENTS = {
+  bestNeutrals: { min: 4, max: 7 },
+  signatureColors: { min: 4, max: 8 },
+  accentColors: { min: 3, max: 5 },
+  useCarefully: { min: 3, max: 6 }
 } as const;
+const HYPOTHESIS_COUNT = { min: 2, max: 3 } as const;
 
 export type PortraitAnalysis = {
   schemaVersion: typeof ANALYSIS_SCHEMA_VERSION;
   generatedAt: string;
   modelUsed: string;
+  imageQuality: ImageQualitySignals;
+  paletteHypotheses: PaletteHypothesis[];
+  canonicalFaceShape?: FaceShapePrinciples;
   depth: Verdict<Depth>;
   contrast: Verdict<Contrast>;
   undertone: Verdict<Undertone> & { displayLabel: string };
   clarity: Verdict<Clarity>;
-  colorSeason: Verdict<string> & { description: string };
   faceShape: Verdict<FaceShape> & {
     forehead: string;
     cheekbones: string;
@@ -88,12 +100,6 @@ export type PortraitAnalysis = {
     notes?: string;
   };
   styleGuardrails: string[];
-  palette: {
-    bestNeutrals: Swatch[];
-    signatureColors: Swatch[];
-    accentColors: Swatch[];
-    avoid: Swatch[];
-  };
   bestMetal: Verdict<Metal>;
   metalVerdicts: Record<Metal, MetalVerdict>;
 };
@@ -108,6 +114,26 @@ export type BodyAnalysis = {
   torsoLegBalance: string;
   bestFeatures: string[];
   silhouetteRules: string[];
+  canonicalSilhouette?: SilhouetteShape;
+};
+
+const BODY_SHAPE_TO_ID: Record<BodyShape, SilhouetteShapeId> = {
+  Hourglass: "hourglass",
+  Pear: "pear",
+  Apple: "apple",
+  Rectangle: "rectangle",
+  "Inverted Triangle": "inverted-triangle"
+};
+
+const FACE_SHAPE_TO_ID: Record<FaceShape, FaceShapeId> = {
+  Oval: "oval",
+  Round: "round",
+  Square: "square",
+  Rectangle: "rectangle",
+  Oblong: "oblong",
+  Heart: "heart",
+  Diamond: "diamond",
+  Triangle: "triangle"
 };
 
 export class AnalysisRefusedError extends Error {
@@ -174,11 +200,12 @@ const PORTRAIT_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
   required: [
+    "imageQuality",
+    "paletteHypotheses",
     "depth",
     "contrast",
     "undertone",
     "clarity",
-    "colorSeason",
     "faceShape",
     "hairColor",
     "eyeColor",
@@ -186,11 +213,57 @@ const PORTRAIT_JSON_SCHEMA = {
     "facialHair",
     "currentHair",
     "styleGuardrails",
-    "palette",
     "bestMetal",
     "metalVerdicts"
   ],
   properties: {
+    imageQuality: {
+      type: "object",
+      additionalProperties: false,
+      required: ["faceSize", "eyesVisible", "lighting", "portraitAngle"],
+      properties: {
+        faceSize: { type: "string", enum: ["small", "good", "large"] },
+        eyesVisible: { type: "boolean" },
+        lighting: { type: "string", enum: ["poor", "mixed", "good"] },
+        portraitAngle: {
+          type: "string",
+          enum: ["front", "slight-angle", "strong-angle"]
+        }
+      }
+    },
+    paletteHypotheses: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "id",
+          "name",
+          "confidence",
+          "supportingSignals",
+          "riskNotes",
+          "palette"
+        ],
+        properties: {
+          id: { type: "string" },
+          name: { type: "string" },
+          confidence: { type: "string", enum: ["high", "medium", "low"] },
+          supportingSignals: { type: "array", items: { type: "string" } },
+          riskNotes: { type: "array", items: { type: "string" } },
+          palette: {
+            type: "object",
+            additionalProperties: false,
+            required: ["bestNeutrals", "signatureColors", "accentColors", "useCarefully"],
+            properties: {
+              bestNeutrals: swatchListSchema,
+              signatureColors: swatchListSchema,
+              accentColors: swatchListSchema,
+              useCarefully: swatchListSchema
+            }
+          }
+        }
+      }
+    },
     depth: verdictSchema(["Light", "Light-Medium", "Medium", "Medium-Deep", "Deep"]),
     contrast: verdictSchema(["Low", "Low-Medium", "Medium", "Medium-High", "High"]),
     undertone: {
@@ -205,17 +278,6 @@ const PORTRAIT_JSON_SCHEMA = {
       }
     },
     clarity: verdictSchema(["Bright", "Muted", "Soft"]),
-    colorSeason: {
-      type: "object",
-      additionalProperties: false,
-      required: ["value", "confidence", "notes", "description"],
-      properties: {
-        value: { type: "string" },
-        confidence: { type: "string", enum: ["high", "medium", "low"] },
-        notes: { type: "string" },
-        description: { type: "string" }
-      }
-    },
     faceShape: {
       type: "object",
       additionalProperties: false,
@@ -280,17 +342,6 @@ const PORTRAIT_JSON_SCHEMA = {
       }
     },
     styleGuardrails: { type: "array", items: { type: "string" } },
-    palette: {
-      type: "object",
-      additionalProperties: false,
-      required: ["bestNeutrals", "signatureColors", "accentColors", "avoid"],
-      properties: {
-        bestNeutrals: swatchListSchema,
-        signatureColors: swatchListSchema,
-        accentColors: swatchListSchema,
-        avoid: swatchListSchema
-      }
-    },
     bestMetal: verdictSchema(["Gold", "Silver", "Rose Gold", "Brass/Bronze"]),
     metalVerdicts: {
       type: "object",
@@ -336,12 +387,12 @@ const BODY_JSON_SCHEMA = {
 const PORTRAIT_PROMPT = `You are a careful color, face, and personal-styling analyst. Analyze the uploaded portrait and return a single JSON object that matches the provided schema exactly.
 
 Guidelines:
+- imageQuality: report what is observable in the photo itself. faceSize: "small" if the face occupies a small fraction of the frame (mostly torso or scenery), "good" if naturally framed, "large" if tightly cropped. eyesVisible: true only if both eyes are clearly visible. lighting: "good" if even and balanced, "mixed" if uneven or with strong color cast, "poor" if very dark, blown-out, or heavily mixed. portraitAngle: "front" if facing camera directly, "slight-angle" for small head turn, "strong-angle" for near-profile.
+- paletteHypotheses: emit 2-3 plausible 12-season hypotheses for this person, ordered by likelihood (most likely first). Use canonical Sci/Art season IDs as 'id', one of: light-spring, true-spring, bright-spring, light-summer, true-summer, soft-summer, soft-autumn, true-autumn, dark-autumn, true-winter, bright-winter, dark-winter. Set 'name' to the corresponding display label (e.g. "Soft Autumn"). 'confidence' reflects relative strength among these hypotheses. 'supportingSignals': 2-4 short observations supporting this hypothesis (e.g. "warm depth", "muted chroma reads in cheekbones"). 'riskNotes': 1-2 short notes on what could undermine confidence (e.g. "harsh sunlight", "narrow eye visibility"). 'palette': for THIS hypothesis, supply 4-7 bestNeutrals, 4-8 signatureColors, 3-5 accentColors, 3-6 useCarefully swatches. Each swatch has a short readable name and a 6-digit hex.
 - Use only what is visible in the photo. Do not invent details.
 - Be conservative on subjective traits. Set confidence to "low" or "medium" when in doubt; reserve "high" for clearly visible traits.
 - Use 'notes' on each verdict to give one short reason rooted in visible features.
 - For undertone.displayLabel, write a short, friendly label such as "Warm (Golden)" or "Cool (Pink)".
-- For colorSeason.value, choose any standard 12-season label such as "Deep Autumn", "Soft Summer", "Bright Spring". Use neutral wording like "most likely" in colorSeason.notes.
-- palette.bestNeutrals: 6-7 swatches. signatureColors: 6-8. accentColors: 4-5. avoid: 5-6. Each swatch has a short readable name and a 6-digit hex.
 - metalVerdicts must include all four metals.
 - presentation.value: how the person *visually presents* in the photo (grooming, styling, hair, facial hair). This is NOT a claim about gender identity — it captures the visible styling cues that downstream image generations should match. Use "Unclear" if you genuinely can't tell.
 - facialHair.value: visible facial hair amount only. "None", "Stubble", "Mustache", "Goatee", "Beard", "Full Beard".
@@ -479,11 +530,128 @@ function validateSwatchList(
   });
 }
 
+function validatePaletteHypothesis(raw: unknown, path: string): PaletteHypothesis {
+  if (!raw || typeof raw !== "object") {
+    throw new AnalysisSchemaError(`${path} is not an object.`);
+  }
+  const obj = raw as Record<string, unknown>;
+  if (!isString(obj.id)) {
+    throw new AnalysisSchemaError(`${path}.id is required.`);
+  }
+  if (!isString(obj.name)) {
+    throw new AnalysisSchemaError(`${path}.name is required.`);
+  }
+  if (!["high", "medium", "low"].includes(String(obj.confidence))) {
+    throw new AnalysisSchemaError(`${path}.confidence is invalid.`);
+  }
+  if (!isStringArray(obj.supportingSignals)) {
+    throw new AnalysisSchemaError(`${path}.supportingSignals must be an array of strings.`);
+  }
+  if (!isStringArray(obj.riskNotes)) {
+    throw new AnalysisSchemaError(`${path}.riskNotes must be an array of strings.`);
+  }
+  const paletteRaw = obj.palette;
+  if (!paletteRaw || typeof paletteRaw !== "object") {
+    throw new AnalysisSchemaError(`${path}.palette is not an object.`);
+  }
+  const p = paletteRaw as Record<string, unknown>;
+
+  const modelPalette = {
+    bestNeutrals: validateSwatchList(
+      p.bestNeutrals,
+      `${path}.palette.bestNeutrals`,
+      HYPOTHESIS_PALETTE_REQUIREMENTS.bestNeutrals
+    ),
+    signatureColors: validateSwatchList(
+      p.signatureColors,
+      `${path}.palette.signatureColors`,
+      HYPOTHESIS_PALETTE_REQUIREMENTS.signatureColors
+    ),
+    accentColors: validateSwatchList(
+      p.accentColors,
+      `${path}.palette.accentColors`,
+      HYPOTHESIS_PALETTE_REQUIREMENTS.accentColors
+    ),
+    useCarefully: validateSwatchList(
+      p.useCarefully,
+      `${path}.palette.useCarefully`,
+      HYPOTHESIS_PALETTE_REQUIREMENTS.useCarefully
+    )
+  };
+
+  // Canonical override: if the model-emitted id (or name, or alias) resolves to a
+  // populated canonical season in app/data/colorSystem.ts, replace the model's
+  // palette with the canonical one. The data file is the source of truth for
+  // hex values; the model only contributes per-photo signals (supporting + risk).
+  const canonicalId = resolveSeasonId(obj.id) ?? resolveSeasonId(obj.name);
+  const canonical = canonicalId ? getSeason(canonicalId) : undefined;
+  const useCanonical = Boolean(canonical && canonical.populated);
+
+  return {
+    id: useCanonical && canonical ? canonical.id : obj.id,
+    name: useCanonical && canonical ? canonical.name : obj.name,
+    confidence: obj.confidence as Confidence,
+    supportingSignals: obj.supportingSignals,
+    riskNotes: obj.riskNotes,
+    palette: useCanonical && canonical ? canonical.palette : modelPalette,
+    rules: useCanonical && canonical ? canonical.rules : undefined
+  };
+}
+
+function validatePaletteHypotheses(raw: unknown): PaletteHypothesis[] {
+  if (!Array.isArray(raw)) {
+    throw new AnalysisSchemaError("paletteHypotheses is not an array.");
+  }
+  if (raw.length < HYPOTHESIS_COUNT.min || raw.length > HYPOTHESIS_COUNT.max) {
+    throw new AnalysisSchemaError(
+      `paletteHypotheses must contain ${HYPOTHESIS_COUNT.min}-${HYPOTHESIS_COUNT.max} entries.`
+    );
+  }
+  return raw.map((item, index) =>
+    validatePaletteHypothesis(item, `paletteHypotheses[${index}]`)
+  );
+}
+
+function validateImageQuality(raw: unknown): ImageQualitySignals {
+  if (!raw || typeof raw !== "object") {
+    throw new AnalysisSchemaError("imageQuality is not an object.");
+  }
+  const iq = raw as Record<string, unknown>;
+  const faceSize = String(iq.faceSize);
+  if (!["small", "good", "large"].includes(faceSize)) {
+    throw new AnalysisSchemaError("imageQuality.faceSize is invalid.");
+  }
+  if (typeof iq.eyesVisible !== "boolean") {
+    throw new AnalysisSchemaError("imageQuality.eyesVisible must be boolean.");
+  }
+  const lighting = String(iq.lighting);
+  if (!["poor", "mixed", "good"].includes(lighting)) {
+    throw new AnalysisSchemaError("imageQuality.lighting is invalid.");
+  }
+  const portraitAngle = String(iq.portraitAngle);
+  if (!["front", "slight-angle", "strong-angle"].includes(portraitAngle)) {
+    throw new AnalysisSchemaError("imageQuality.portraitAngle is invalid.");
+  }
+  const rawSignals: ImageQualityRawSignals = {
+    faceSize: faceSize as ImageQualityRawSignals["faceSize"],
+    eyesVisible: iq.eyesVisible,
+    lighting: lighting as ImageQualityRawSignals["lighting"],
+    portraitAngle: portraitAngle as ImageQualityRawSignals["portraitAngle"]
+  };
+  return {
+    ...rawSignals,
+    confidencePenalty: computeConfidencePenalty(rawSignals)
+  };
+}
+
 function validatePortrait(raw: unknown): PortraitAnalysis {
   if (!raw || typeof raw !== "object") {
     throw new AnalysisSchemaError("Portrait analysis is not an object.");
   }
   const o = raw as Record<string, unknown>;
+
+  const imageQuality = validateImageQuality(o.imageQuality);
+  const paletteHypotheses = validatePaletteHypotheses(o.paletteHypotheses);
 
   const depth = validateVerdict<Depth>(
     o.depth,
@@ -515,18 +683,6 @@ function validatePortrait(raw: unknown): PortraitAnalysis {
     ["Bright", "Muted", "Soft"],
     "clarity"
   );
-
-  const seasonRaw = o.colorSeason;
-  if (!seasonRaw || typeof seasonRaw !== "object") {
-    throw new AnalysisSchemaError("colorSeason is not an object.");
-  }
-  const seasonObj = seasonRaw as Record<string, unknown>;
-  if (!isString(seasonObj.value) || !isString(seasonObj.description)) {
-    throw new AnalysisSchemaError("colorSeason.value or .description missing.");
-  }
-  if (!["high", "medium", "low"].includes(String(seasonObj.confidence))) {
-    throw new AnalysisSchemaError("colorSeason.confidence invalid.");
-  }
 
   const faceRaw = o.faceShape;
   if (!faceRaw || typeof faceRaw !== "object") {
@@ -587,30 +743,6 @@ function validatePortrait(raw: unknown): PortraitAnalysis {
   }
   const styleGuardrails = o.styleGuardrails;
 
-  const paletteRaw = o.palette;
-  if (!paletteRaw || typeof paletteRaw !== "object") {
-    throw new AnalysisSchemaError("palette is not an object.");
-  }
-  const p = paletteRaw as Record<string, unknown>;
-  const palette = {
-    bestNeutrals: validateSwatchList(
-      p.bestNeutrals,
-      "palette.bestNeutrals",
-      PALETTE_REQUIREMENTS.bestNeutrals
-    ),
-    signatureColors: validateSwatchList(
-      p.signatureColors,
-      "palette.signatureColors",
-      PALETTE_REQUIREMENTS.signatureColors
-    ),
-    accentColors: validateSwatchList(
-      p.accentColors,
-      "palette.accentColors",
-      PALETTE_REQUIREMENTS.accentColors
-    ),
-    avoid: validateSwatchList(p.avoid, "palette.avoid", PALETTE_REQUIREMENTS.avoid)
-  };
-
   const bestMetal = validateVerdict<Metal>(
     o.bestMetal,
     ["Gold", "Silver", "Rose Gold", "Brass/Bronze"],
@@ -631,20 +763,24 @@ function validatePortrait(raw: unknown): PortraitAnalysis {
     metalVerdicts[metal] = v[metal] as MetalVerdict;
   }
 
+  // Canonical face-shape attachment: same pattern as colorSystem and silhouette.
+  // Validator looks up the face shape and attaches canonical principles.
+  const canonicalFaceShapeId = FACE_SHAPE_TO_ID[faceBase.value];
+  const canonicalFaceShape = canonicalFaceShapeId
+    ? FACE_SHAPE_RULES[canonicalFaceShapeId]
+    : undefined;
+
   return {
     schemaVersion: ANALYSIS_SCHEMA_VERSION,
     generatedAt: new Date().toISOString(),
     modelUsed: ANALYSIS_MODEL,
+    imageQuality,
+    paletteHypotheses,
+    canonicalFaceShape,
     depth,
     contrast,
     undertone: { ...undertoneBase, displayLabel },
     clarity,
-    colorSeason: {
-      value: seasonObj.value,
-      confidence: seasonObj.confidence as Confidence,
-      notes: typeof seasonObj.notes === "string" ? seasonObj.notes : undefined,
-      description: seasonObj.description
-    },
     faceShape: {
       ...faceBase,
       forehead: f.forehead,
@@ -659,7 +795,6 @@ function validatePortrait(raw: unknown): PortraitAnalysis {
     facialHair,
     currentHair,
     styleGuardrails,
-    palette,
     bestMetal,
     metalVerdicts
   };
@@ -688,6 +823,16 @@ function validateBody(raw: unknown): BodyAnalysis {
     throw new AnalysisSchemaError("bestFeatures or silhouetteRules invalid.");
   }
 
+  // Canonical override: look up the canonical silhouette principles for the
+  // identified body shape. Same pattern as the palette canonical override —
+  // the data file is the source of truth for principles; the model only
+  // contributes per-photo observations (shoulderHipBalance, waistDefinition,
+  // torsoLegBalance, bestFeatures, silhouetteRules).
+  const canonicalShapeId = BODY_SHAPE_TO_ID[bodyShape.value];
+  const canonicalSilhouette = canonicalShapeId
+    ? SILHOUETTE_RULES.shapes[canonicalShapeId]
+    : undefined;
+
   return {
     schemaVersion: ANALYSIS_SCHEMA_VERSION,
     generatedAt: new Date().toISOString(),
@@ -697,7 +842,8 @@ function validateBody(raw: unknown): BodyAnalysis {
     waistDefinition: o.waistDefinition,
     torsoLegBalance: o.torsoLegBalance,
     bestFeatures: o.bestFeatures,
-    silhouetteRules: o.silhouetteRules
+    silhouetteRules: o.silhouetteRules,
+    canonicalSilhouette
   };
 }
 
